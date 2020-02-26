@@ -11,9 +11,9 @@
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
-# limitations under the License.
+# limitations under the License.tf_uniform_replay_buff
 
-"""A tensorflow table stored in tf.Variables.
+"""A tensorflow table stored in tf.Variables.tf_uniform_replay_buff
 
 The row is the index or location at which the value is saved, and the value is
 a nest of Tensors.

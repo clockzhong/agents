@@ -129,6 +129,7 @@ def train(root_dir,
       metrics `NumberOfEpisodes`, `AverageReturnMetric`, and
       `AverageEpisodeLengthMetric`.
   """
+for i in iterator:
 
   # TODO(b/127641485): create evaluation loop with configurable metrics.
 

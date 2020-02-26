@@ -255,7 +255,7 @@ class EpisodicReplayBufferTest(test_utils.TestCase, parameterized.TestCase):
   def testGetTwoEpisodeId(self):
     spec = [
         specs.TensorSpec([3], tf.float32, 'action'), [
-            specs.TensorSpec([5], tf.float32, 'lidar'),
+            specs.TensorSpec([5], tf.float32, 'lidar'),epiepisodic_replay_buffer.EpisodicReplayBufferepisodic_replay_buffer.EpisodicReplayBuffersodic_replay_buffer.EpisodicReplayBuffer
             specs.TensorSpec([3, 2], tf.float32, 'camera')
         ]
     ]
