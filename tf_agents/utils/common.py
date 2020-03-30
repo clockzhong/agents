@@ -89,6 +89,33 @@ def in_legacy_tf1():
   return _IN_LEGACY_TF1
 
 
+def set_default_tf_function_parameters(*args, **kwargs):
+  """Generates a decorator that sets default parameters for `tf.function`.
+
+  Args:
+    *args: default arguments for the `tf.function`.
+    **kwargs: default keyword arguments for the `tf.function`.
+
+  Returns:
+    Function decorator with preconfigured defaults for `tf.function`.
+  """
+  def maybe_wrap(fn):
+    """Helper function."""
+    wrapped = [None]
+
+    @functools.wraps(fn)
+    def preconfigured_function(*fn_args, **fn_kwargs):
+      if tf.executing_eagerly():
+        return fn(*fn_args, **fn_kwargs)
+      if wrapped[0] is None:
+        wrapped[0] = function(*((fn,) + args), **kwargs)
+      return wrapped[0](*fn_args, **fn_kwargs)  # pylint: disable=not-callable
+
+    return preconfigured_function
+
+  return maybe_wrap
+
+
 def function(*args, **kwargs):
   """Wrapper for tf.function with TF Agents-specific customizations.
 
@@ -147,6 +174,7 @@ def function_in_tf1(*args, **kwargs):
     """Helper function."""
     # We're in TF1 mode and want to wrap in common.function to get autodeps.
     wrapped = [None]
+
     @functools.wraps(fn)
     def with_check_resource_vars(*fn_args, **fn_kwargs):
       """Helper function for calling common.function."""
@@ -158,9 +186,11 @@ def function_in_tf1(*args, **kwargs):
       if not resource_variables_enabled():
         raise RuntimeError(MISSING_RESOURCE_VARIABLES_ERROR)
       if wrapped[0] is None:
-        wrapped[0] = function(*args, **kwargs)(fn)
+        wrapped[0] = function(*((fn,) + args), **kwargs)
       return wrapped[0](*fn_args, **fn_kwargs)  # pylint: disable=not-callable
+
     return with_check_resource_vars
+
   return maybe_wrap
 
 
@@ -283,7 +313,7 @@ def soft_variables_update(source_variables,
     # batch norm stats) do a regular assign, which will cause a sync and
     # broadcast from replica 0, so will have slower performance but will be
     # correct and not cause a failure.
-    if strategy is not None and v_t.trainable:
+    if tf.distribute.has_strategy() and v_t.trainable:
       # Assignment happens independently on each replica,
       # see b/140690837 #46.
       update = strategy.extended.update(v_t, update_fn, args=(v_s,))
@@ -998,12 +1028,18 @@ def replicate(tensor, outer_shape):
   if outer_ndims == 0:
     return tensor
 
+  # Calculate target shape of replicated tensor
+  target_shape = tf.concat([outer_shape, tf.shape(input=tensor)], axis=0)
+
+  # tf.tile expects `tensor` to be at least 1D
+  if tensor_ndims == 0:
+    tensor = tensor[None]
+
   # Replicate tensor "t" along the 1st dimension.
   tiled_tensor = tf.tile(tensor, [tf.reduce_prod(input_tensor=outer_shape)] +
                          [1] * (tensor_ndims - 1))
 
   # Reshape to match outer_shape.
-  target_shape = tf.concat([outer_shape, tf.shape(input=tensor)], axis=0)
   return tf.reshape(tiled_tensor, target_shape)
 
 

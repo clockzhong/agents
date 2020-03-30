@@ -14,7 +14,6 @@
 # limitations under the License.
 
 """TF-Agents SavedModel API."""
-
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -26,8 +25,12 @@ import os
 import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
 
 from tf_agents.policies import tf_policy
+from tf_agents.specs import tensor_spec
+from tf_agents.trajectories import time_step as ts
 from tf_agents.utils import common
 from tf_agents.utils import nest_utils
+
+POLICY_SPECS_PBTXT = 'policy_specs.pbtxt'
 
 
 def _true_if_missing_or_collision(spec, spec_names):
@@ -171,8 +174,16 @@ class PolicySaver(object):
     # Make a shallow copy as we'll be making some changes in-place.
     policy = copy.copy(policy)
     if train_step is None:
-      train_step = tf.constant(-1)
+      if not tf.executing_eagerly():
+        raise ValueError('train_step must be a `tf.Variable`: %s' % train_step)
+      train_step = common.create_variable('train_step', initial_value=-1)
+    elif not isinstance(train_step, tf.Variable):
+      raise ValueError('train_step must be a TensorFlow variable: %s' %
+                       train_step)
     policy.train_step = train_step
+
+    # We will need the train step for the Checkpoint object.
+    self._train_step = train_step
 
     if batch_size is None:
       get_initial_state_fn = policy.get_initial_state
@@ -293,34 +304,67 @@ class PolicySaver(object):
 
     policy.action = polymorphic_action_fn
     policy.get_initial_state = get_initial_state_fn
-    policy.train_step = train_step_fn
+    policy.get_train_step = train_step_fn
     # Adding variables as an attribute to facilitate updating them.
     policy.model_variables = policy.variables()
 
     self._policy = policy
     self._signatures = signatures
 
+  def get_train_step(self):
+    """Returns the train step of the policy.
+
+    Returns:
+      An integer.
+    """
+    return self._train_step.numpy()
+
   def save(self, export_dir):
     """Save the policy to the given `export_dir`."""
-    return tf.saved_model.save(
-        self._policy, export_dir, signatures=self._signatures)
+    tf.saved_model.save(self._policy, export_dir, signatures=self._signatures)
+
+    spec_output_path = os.path.join(export_dir, POLICY_SPECS_PBTXT)
+    specs = {
+        'collect_data_spec': self._policy.collect_data_spec,
+        'policy_state_spec': self._policy.policy_state_spec
+    }
+    tensor_spec.to_pbtxt_file(spec_output_path, specs)
 
   def save_checkpoint(self, export_dir):
-    """Saves the policy as a checkpoint to the given `export_dir.
+    """Saves the policy as a checkpoint to the given `export_dir`.
 
-    **Note**: For the checkpoint to be useful users should first call `save` to
-      generate a saved_model of the policy. Checkpoints can then be used to
-      update the policy without having to reload the saved_model, or saving
-      multiple copies of the saved_model.pb file.
+    This will only work with checkpoints generated in TF2.x.
 
+    For the checkpoint to be useful users should first call `save` to generate a
+    saved_model of the policy. Checkpoints can then be used to update the policy
+    without having to reload the saved_model, or saving multiple copies of the
+    `saved_model.pb` file.
 
-    **Note**: This will only work with checkpoints generated in TF2.x
+    The checkpoint is always created in the sub-directory 'variables/' and the
+    checkpoint file prefix used is 'variables'. The checkpoint files are as
+    follows:
+       * export_dir/variables/variables.index
+       * export_dir/variables/variables-xxxxx-of-xxxxx
+
+    This makes the files compatible with the checkpoint part of full saved
+    models, which enables you to load a saved model made up from the graph part
+    of a full saved model and the variables part of a checkpoint.
 
     Args:
       export_dir: Directory to save the checkpoint to.
     """
-    checkpoint = tf.train.Checkpoint(policy=self._policy)
-    checkpoint.save(file_prefix=os.path.join(export_dir, 'policy_checkpoint'))
+    # In addition to the policy, also list dependencies on model_variables and
+    # train_step so the checkpoint can be combined with a saved graph from a
+    # full saved model.
+    checkpoint = tf.train.Checkpoint(
+        policy=self._policy,
+        model_variables=self._policy.variables(),
+        train_step=self._train_step)
+    # Use write() to make sure that the file prefix is not modified by appending
+    # a save counter value.
+    checkpoint.write(
+        file_prefix=os.path.join(export_dir, tf.saved_model.VARIABLES_DIRECTORY,
+                                 tf.saved_model.VARIABLES_FILENAME))
 
 
 def _function_with_flat_signature(function,
@@ -369,3 +413,45 @@ def _function_with_flat_signature(function,
     return dict_outputs_
 
   return function_with_signature
+
+
+def specs_from_collect_data_spec(loaded_policy_specs):
+  """Creates policy specs from specs loaded from disk.
+
+  The PolicySaver saves policy specs next to the saved model as
+  a `struct.StructuredValue` proto. This recreates the
+  original specs from the proto.
+
+  Pass the proto loaded from the file with `tensor_spec.from_pbtxt_file()`
+  to this function.
+
+  Args:
+     loaded_policy_specs: `struct.StructuredValue` proto that had been
+       previously created by PolicySaver as a pbtxt.
+
+  Returns:
+    A dict with specs extracted from the proto. The dict contains the following
+    keys and values. Except `time_step_spec` all the specs are nests of
+    `ArraySpecs`.
+       * `collect_data_spec`: Collect data spec for the policy.
+       * `time_step_spec`: `TimeStepSpec` for the policy.
+       * `action_spec`:  Action spec for the policy
+       * `policy_state_spec`: State spec for the policy.
+       * `info_spec`: Info spec for the policy.
+  """
+  policy_specs = tensor_spec.to_nest_array_spec(loaded_policy_specs)
+  collect_data_spec = policy_specs['collect_data_spec']
+  policy_state_spec = policy_specs['policy_state_spec']
+  time_step_spec = ts.TimeStep(
+      step_type=collect_data_spec.step_type,
+      reward=collect_data_spec.reward,
+      discount=collect_data_spec.discount,
+      observation=collect_data_spec.observation)
+  action_spec = collect_data_spec.action
+  info_spec = collect_data_spec.policy_info
+  return dict(
+      collect_data_spec=collect_data_spec,
+      time_step_spec=time_step_spec,
+      action_spec=action_spec,
+      policy_state_spec=policy_state_spec,
+      info_spec=info_spec)

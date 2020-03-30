@@ -164,6 +164,24 @@ class SavedModelPYTFEagerPolicyTest(test_utils.TestCase,
     np.testing.assert_array_almost_equal(original_action_np.action,
                                          saved_policy_action.action)
 
+  def testSavedModelLoadingSpecs(self):
+    path = os.path.join(self.get_temp_dir(), 'saved_policy')
+    saver = policy_saver.PolicySaver(self.tf_policy)
+    saver.save(path)
+
+    eager_py_policy = py_tf_eager_policy.SavedModelPyTFEagerPolicy(
+        path, load_specs_from_pbtxt=True)
+
+    # Bounded specs get converted to regular specs when saved into a proto.
+    def assert_specs_mostly_equal(loaded_spec, expected_spec):
+      self.assertEqual(loaded_spec.shape, expected_spec.shape)
+      self.assertEqual(loaded_spec.dtype, expected_spec.dtype)
+
+    tf.nest.map_structure(assert_specs_mostly_equal,
+                          eager_py_policy.time_step_spec, self.time_step_spec)
+    tf.nest.map_structure(assert_specs_mostly_equal,
+                          eager_py_policy.action_spec, self.action_spec)
+
   @parameterized.parameters(None, 0, 100, 200000)
   def testGetTrainStep(self, train_step):
     path = os.path.join(self.get_temp_dir(), 'saved_policy')
@@ -173,7 +191,9 @@ class SavedModelPYTFEagerPolicyTest(test_utils.TestCase,
       expected_train_step = -1
     else:
       saver = policy_saver.PolicySaver(
-          self.tf_policy, train_step=tf.constant(train_step))
+          self.tf_policy,
+          train_step=common.create_variable(
+              'train_step', initial_value=train_step))
       expected_train_step = train_step
     saver.save(path)
 
@@ -183,6 +203,9 @@ class SavedModelPYTFEagerPolicyTest(test_utils.TestCase,
     self.assertEqual(expected_train_step, eager_py_policy.get_train_step())
 
   def testUpdateFromCheckpoint(self):
+    if not common.has_eager_been_enabled():
+      self.skipTest('Only supported in TF2.x.')
+
     path = os.path.join(self.get_temp_dir(), 'saved_policy')
     saver = policy_saver.PolicySaver(self.tf_policy)
     saver.save(path)
@@ -198,11 +221,7 @@ class SavedModelPYTFEagerPolicyTest(test_utils.TestCase,
     # Use evaluate to force a copy.
     saved_model_variables = self.evaluate(eager_py_policy.variables())
 
-    checkpoint = tf.train.Checkpoint(policy=eager_py_policy._policy)
-    manager = tf.train.CheckpointManager(
-        checkpoint, directory=checkpoint_path, max_to_keep=None)
-
-    eager_py_policy.update_from_checkpoint(manager.latest_checkpoint)
+    eager_py_policy.update_from_checkpoint(checkpoint_path)
 
     assert_np_not_equal = lambda a, b: self.assertFalse(np.equal(a, b).all())
     tf.nest.map_structure(assert_np_not_equal, saved_model_variables,
@@ -214,6 +233,9 @@ class SavedModelPYTFEagerPolicyTest(test_utils.TestCase,
                           self.evaluate(eager_py_policy.variables()))
 
   def testInferenceFromCheckpoint(self):
+    if not common.has_eager_been_enabled():
+      self.skipTest('Only supported in TF2.x.')
+
     path = os.path.join(self.get_temp_dir(), 'saved_policy')
     saver = policy_saver.PolicySaver(self.tf_policy)
     saver.save(path)
@@ -234,11 +256,7 @@ class SavedModelPYTFEagerPolicyTest(test_utils.TestCase,
     # Use evaluate to force a copy.
     saved_model_variables = self.evaluate(eager_py_policy.variables())
 
-    checkpoint = tf.train.Checkpoint(policy=eager_py_policy._policy)
-    manager = tf.train.CheckpointManager(
-        checkpoint, directory=checkpoint_path, max_to_keep=None)
-
-    eager_py_policy.update_from_checkpoint(manager.latest_checkpoint)
+    eager_py_policy.update_from_checkpoint(checkpoint_path)
 
     assert_np_not_equal = lambda a, b: self.assertFalse(np.equal(a, b).all())
     tf.nest.map_structure(assert_np_not_equal, saved_model_variables,
