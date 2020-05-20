@@ -33,77 +33,72 @@ from tf_agents.utils import nest_utils
 tfd = tfp.distributions
 
 
-class Base(tf.Module):
+class TFPolicy(tf.Module):
   """Abstract base class for TF Policies.
 
-  Example of simple use in TF:
+  The Policy represents a mapping from `time_steps` recieved from the
+  environment to `actions` that can be applied to the environment.
 
-    tf_env = SomeTFEnvironment()
-    policy = SomeTFPolicy()
+  Agents expose two policies. A `policy` meant for deployment and evaluation,
+  and a `collect_policy` for collecting data from the environment. The
+  `collect_policy` is usually stochastic for exploring the environment better
+  and may log auxilliary information such as log probabilities required for
+  training as well. `Policy` objects can also be created directly by the users
+  without using an `Agent`.
 
-    time_step, step_state, reset_env = tf_env.reset()
-    policy_state = policy.get_initial_state(batch_size=tf_env.batch_size)
-    action_step = policy.action(time_step, policy_state)
-    next_time_step, _ = env.step(action_step.action, step_state)
+  The main methods of TFPolicy are:
 
-    sess.run([time_step, action, next_time_step])
+  * `action`: Maps a `time_step` from the environment to an action.
+  * `distribution`: Maps a `time_step` to a distribution over actions.
+  * `get_initial_state`: Generates the initial state for stateful policies, e.g.
+      RNN/LSTM policies.
+
+  Example usage:
+
+  ```
+  env = SomeTFEnvironment()
+  policy = TFRandomPolicy(env.time_step_spec(), env.action_spec())
+  # Or policy = agent.policy or agent.collect_policy
+
+  policy_state = policy.get_initial_state(env.batch_size)
+  time_step = env.reset()
+
+  while not time_step.is_last():
+    policy_step = policy.action(time_step, policy_state)
+    time_step = env.step(policy_step.action)
+
+    policy_state = policy_step.state
+    # policy_step.info may contain side info for logging, such as action log
+    # probabilities.
+  ```
+
+  Policies can be saved to disk as SavedModels (see policy_saver.py and
+  policy_loader.py) or as TF Checkpoints.
+
+  A `PyTFEagerPolicy` can be used to wrap a `TFPolicy` so that it works with
+  `PyEnvironment`s.
 
 
-  Example of using the same policy for several steps:
+  **NOTE**: For API consistency, subclasses are not allowed to override public
+  methods of `TFPolicy` class. Instead, they may implement the protected methods
+  including `_get_initial_state`, `_action`, and `_distribution`. This
+  public-calls-private convention allowed this base class to do things like
+  properly add `spec` and shape checks, which provide users an easier experience
+  when debugging their environments and networks.
 
-    tf_env = SomeTFEnvironment()
-    policy = SomeTFPolicy()
-
-    exp_policy = SomeTFPolicy()
-    update_policy = exp_policy.update(policy)
-    policy_state = exp_policy.get_initial_state(tf_env.batch_size)
-
-    time_step, step_state, _ = tf_env.reset()
-    action_step, policy_state, _ = exp_policy.action(time_step, policy_state)
-    next_time_step, step_state = env.step(action_step.action, step_state)
-
-    for j in range(num_episodes):
-      sess.run(update_policy)
-      for i in range(num_steps):
-        sess.run([time_step, action_step, next_time_step])
-
-
-  Example with multiple steps:
-
-    tf_env = SomeTFEnvironment()
-    policy = SomeTFPolicy()
-
-    # reset() creates the initial time_step and step_state, plus a reset_op
-    time_step, step_state, reset_op = tf_env.reset()
-    policy_state = policy.get_initial_state(tf_env.batch_size)
-    n_step = [time_step]
-    for i in range(n):
-      action_step = policy.action(time_step, policy_state)
-      policy_state = action_step.state
-      n_step.append(action_step)
-      time_step, step_state = tf_env.step(action_step.action, step_state)
-      n_step.append(time_step)
-
-    # n_step contains [time_step, action, time_step, action, ...]
-    sess.run(n_step)
-
-  Example with explicit resets:
-
-    tf_env = SomeTFEnvironment()
-    policy = SomeTFPolicy()
-    policy_state = policy.get_initial_state(tf_env.batch_size)
-
-    time_step, step_state, reset_env = tf_env.reset()
-    action_step = policy.action(time_step, policy_state)
-    # It applies the action and returns the new TimeStep.
-    next_time_step, _ = tf_env.step(action_step.action, step_state)
-    next_action_step = policy.action(next_time_step, policy_state)
-
-    # The Environment and the Policy would be reset before starting.
-    sess.run([time_step, action_step, next_time_step, next_action_step])
-    # Will force reset the Environment and the Policy.
-    sess.run([reset_env])
-    sess.run([time_step, action_step, next_time_step, next_action_step])
+  For researchers, and those developing new Policies, the `TFPolicy` base class
+  constructor also accept a `validate_args` parameter.  If `False`, this
+  disables all spec structure, dtype, and shape checks in the public methods of
+  these classes.  It allows algorithm developers to iterate and try different
+  input and output structures without worrying about overly restrictive
+  requirements, or input and output states being in a certain format.  However,
+  *disabling argument validation* can make it very hard to identify structural
+  input or algorithmic errors; and should not be done for final, or
+  production-ready, Policies.  In addition to having implementations that may
+  disagree with specs, this mean that the resulting Policy may no longer
+  interact well with other parts of TF-Agents.  Examples include impedance
+  mismatches with Actor/Learner APIs, replay buffers, and the model export
+  functionality in `PolicySaver.
   """
 
   # TODO(b/127327645) Remove this attribute.
@@ -120,8 +115,9 @@ class Base(tf.Module):
                emit_log_probability=False,
                automatic_state_reset=True,
                observation_and_action_constraint_splitter=None,
+               validate_args=True,
                name=None):
-    """Initialization of Base class.
+    """Initialization of TFPolicy class.
 
     Args:
       time_step_spec: A `TimeStep` spec of the expected time_steps. Usually
@@ -160,12 +156,21 @@ class Base(tf.Module):
           observation before passing to the network. If
           `observation_and_action_constraint_splitter` is None, action
           constraints are not applied.
+      validate_args: Python bool.  Whether to verify inputs to, and outputs of,
+        functions like `action` and `distribution` against spec structures,
+        dtypes, and shapes.
+
+        Research code may prefer to set this value to `False` to allow iterating
+        on input and output structures without being hamstrung by overly
+        rigid checking (at the cost of harder-to-debug errors).
+
+        See also `TFAgent.validate_args`.
       name: A name for this module. Defaults to the class name.
     """
-    super(Base, self).__init__(name=name)
+    super(TFPolicy, self).__init__(name=name)
     common.check_tf1_allowed()
     common.tf_agents_gauge.get_cell('TFAPolicy').set(True)
-    common.assert_members_are_not_overridden(base_cls=Base, instance=self)
+    common.assert_members_are_not_overridden(base_cls=TFPolicy, instance=self)
     if not isinstance(time_step_spec, ts.TimeStep):
       raise ValueError(
           'The `time_step_spec` must be an instance of `TimeStep`, but is `{}`.'
@@ -175,6 +180,8 @@ class Base(tf.Module):
     self._action_spec = action_spec
     self._policy_state_spec = policy_state_spec
     self._emit_log_probability = emit_log_probability
+    self._validate_args = validate_args
+
     if emit_log_probability:
       log_probability_spec = tensor_spec.BoundedTensorSpec(
           shape=(),
@@ -206,11 +213,17 @@ class Base(tf.Module):
 
   def variables(self):
     """Returns the list of Variables that belong to the policy."""
-    return self._variables()
+    # Ignore self._variables() in favor of using tf.Module's tracking.
+    return super(TFPolicy, self).variables
 
   @property
   def observation_and_action_constraint_splitter(self):
     return self._observation_and_action_constraint_splitter
+
+  @property
+  def validate_args(self):
+    """Whether `action` & `distribution` validate input and output args."""
+    return self._validate_args
 
   def get_initial_state(self, batch_size):
     """Returns an initial state usable by the policy.
@@ -255,12 +268,15 @@ class Base(tf.Module):
 
     Returns:
       A `PolicyStep` named tuple containing:
-        `action`: An action Tensor matching the `action_spec()`.
+        `action`: An action Tensor matching the `action_spec`.
         `state`: A policy state tensor to be fed into the next call to action.
         `info`: Optional side information such as action log probabilities.
 
     Raises:
       RuntimeError: If subclass __init__ didn't call super().__init__.
+      ValueError or TypeError: If `validate_args is True` and inputs or
+        outputs do not match `time_step_spec`, `policy_state_spec`,
+        or `policy_step_spec`.
     """
     if self._enable_functions and getattr(self, '_action_fn', None) is None:
       raise RuntimeError(
@@ -271,8 +287,18 @@ class Base(tf.Module):
     else:
       action_fn = self._action
 
-    tf.nest.assert_same_structure(time_step, self._time_step_spec)
-    tf.nest.assert_same_structure(policy_state, self._policy_state_spec)
+    if self._validate_args:
+      time_step = nest_utils.prune_extra_keys(self._time_step_spec, time_step)
+      policy_state = nest_utils.prune_extra_keys(
+          self._policy_state_spec, policy_state)
+      nest_utils.assert_same_structure(
+          time_step,
+          self._time_step_spec,
+          message='time_step and time_step_spec structures do not match')
+      nest_utils.assert_same_structure(
+          policy_state,
+          self._policy_state_spec,
+          message='policy_state and policy_state_spec structures do not match')
 
     if self._automatic_state_reset:
       policy_state = self._maybe_reset_state(time_step, policy_state)
@@ -283,27 +309,39 @@ class Base(tf.Module):
         return common.clip_to_spec(action, action_spec)
       return action
 
+    if self._validate_args:
+      nest_utils.assert_same_structure(
+          step.action, self._action_spec,
+          message='action and action_spec structures do not match')
+
     if self._clip:
-      clipped_actions = tf.nest.map_structure(clip_action, step.action,
+      clipped_actions = tf.nest.map_structure(clip_action,
+                                              step.action,
                                               self._action_spec)
       step = step._replace(action=clipped_actions)
 
-    tf.nest.assert_same_structure(step, self._policy_step_spec)
+    if self._validate_args:
+      nest_utils.assert_same_structure(
+          step,
+          self._policy_step_spec,
+          message='action output and policy_step_spec structures do not match')
 
-    def compare_to_spec(value, spec):
-      return value.dtype.is_compatible_with(spec.dtype)
+      def compare_to_spec(value, spec):
+        return value.dtype.is_compatible_with(spec.dtype)
 
-    compatibility = tf.nest.flatten(
-        tf.nest.map_structure(compare_to_spec, step.action, self.action_spec))
+      compatibility = [
+          compare_to_spec(v, s) for (v, s)
+          in zip(tf.nest.flatten(step.action),
+                 tf.nest.flatten(self.action_spec))]
 
-    if not all(compatibility):
-      get_dtype = lambda x: x.dtype
-      action_dtypes = tf.nest.map_structure(get_dtype, step.action)
-      spec_dtypes = tf.nest.map_structure(get_dtype, self.action_spec)
+      if not all(compatibility):
+        get_dtype = lambda x: x.dtype
+        action_dtypes = tf.nest.map_structure(get_dtype, step.action)
+        spec_dtypes = tf.nest.map_structure(get_dtype, self.action_spec)
 
-      raise TypeError('Policy produced an action with a dtype that doesn\'t '
-                      'match its action_spec. Got action: %s with '
-                      'action_spec: %s' % (action_dtypes, spec_dtypes))
+        raise TypeError('Policy produced an action with a dtype that doesn\'t '
+                        'match its action_spec. Got action:\n  %s\n with '
+                        'action_spec:\n  %s' % (action_dtypes, spec_dtypes))
 
     return step
 
@@ -321,9 +359,24 @@ class Base(tf.Module):
         `action`: A tf.distribution capturing the distribution of next actions.
         `state`: A policy state tensor for the next call to distribution.
         `info`: Optional side information such as action log probabilities.
+
+    Raises:
+      ValueError or TypeError: If `validate_args is True` and inputs or
+        outputs do not match `time_step_spec`, `policy_state_spec`,
+        or `policy_step_spec`.
     """
-    tf.nest.assert_same_structure(time_step, self._time_step_spec)
-    tf.nest.assert_same_structure(policy_state, self._policy_state_spec)
+    if self._validate_args:
+      time_step = nest_utils.prune_extra_keys(self._time_step_spec, time_step)
+      policy_state = nest_utils.prune_extra_keys(
+          self._policy_state_spec, policy_state)
+      nest_utils.assert_same_structure(
+          time_step,
+          self._time_step_spec,
+          message='time_step and time_step_spec structures do not match')
+      nest_utils.assert_same_structure(
+          policy_state,
+          self._policy_state_spec,
+          message='policy_state and policy_state_spec structures do not match')
     if self._automatic_state_reset:
       policy_state = self._maybe_reset_state(time_step, policy_state)
     step = self._distribution(time_step=time_step, policy_state=policy_state)
@@ -335,7 +388,12 @@ class Base(tf.Module):
               lambda _: tf.constant(0., dtype=tf.float32),
               policy_step.get_log_probability(self._info_spec)))
       step = step._replace(info=info)
-    tf.nest.assert_same_structure(step, self._policy_step_spec)
+    if self._validate_args:
+      nest_utils.assert_same_structure(
+          step,
+          self._policy_step_spec,
+          message=('distribution output and policy_step_spec structures '
+                   'do not match'))
     return step
 
   def update(self,
@@ -471,11 +529,11 @@ class Base(tf.Module):
 
     Returns:
       A `PolicyStep` named tuple containing:
-        `action`: An action Tensor matching the `action_spec()`.
+        `action`: An action Tensor matching the `action_spec`.
         `state`: A policy state tensor to be fed into the next call to action.
         `info`: Optional side information such as action log probabilities.
     """
-    seed_stream = tfp.util.SeedStream(seed=seed, salt='ppo_policy')
+    seed_stream = tfp.util.SeedStream(seed=seed, salt='tf_agents_tf_policy')
     distribution_step = self._distribution(time_step, policy_state)
     actions = tf.nest.map_structure(
         lambda d: reparameterized_sampling.sample(d, seed=seed_stream()),
@@ -511,11 +569,6 @@ class Base(tf.Module):
         `state`: A policy state tensor for the next call to distribution.
         `info`: Optional side information such as action log probabilities.
     """
-    pass
-
-  @abc.abstractmethod
-  def _variables(self):
-    """Returns an iterable of `tf.Variable` objects used by this policy."""
     pass
 
   # Subclasses MAY optionally overwrite _get_initial_state.

@@ -37,14 +37,14 @@ tfd = tfp.distributions
 
 
 @gin.configurable(module='tf_agents', blacklist=['policy'])
-class EpsilonGreedyPolicy(tf_policy.Base):
+class EpsilonGreedyPolicy(tf_policy.TFPolicy):
   """Returns epsilon-greedy samples of a given policy."""
 
   def __init__(self, policy, epsilon, name=None):
     """Builds an epsilon-greedy MixturePolicy wrapping the given policy.
 
     Args:
-      policy: A policy implementing the tf_policy.Base interface.
+      policy: A policy implementing the tf_policy.TFPolicy interface.
       epsilon: The probability of taking the random action represented as a
         float scalar, a scalar Tensor of shape=(), or a callable that returns a
         float scalar or Tensor.
@@ -55,6 +55,8 @@ class EpsilonGreedyPolicy(tf_policy.Base):
     """
     observation_and_action_constraint_splitter = getattr(
         policy, 'observation_and_action_constraint_splitter', None)
+    accepts_per_arm_features = getattr(policy, 'accepts_per_arm_features',
+                                       False)
     self._greedy_policy = greedy_policy.GreedyPolicy(policy)
     self._epsilon = epsilon
     self._random_policy = random_tf_policy.RandomTFPolicy(
@@ -63,6 +65,7 @@ class EpsilonGreedyPolicy(tf_policy.Base):
         emit_log_probability=policy.emit_log_probability,
         observation_and_action_constraint_splitter=(
             observation_and_action_constraint_splitter),
+        accepts_per_arm_features=accepts_per_arm_features,
         info_spec=policy.info_spec)
     super(EpsilonGreedyPolicy, self).__init__(
         policy.time_step_spec,

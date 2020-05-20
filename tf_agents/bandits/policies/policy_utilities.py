@@ -35,6 +35,8 @@ class InfoFields(object):
   PREDICTED_REWARDS_SAMPLED = 'predicted_rewards_sampled'
   # Type of bandit policy (see enumerations in `BanditPolicyType`).
   BANDIT_POLICY_TYPE = 'bandit_policy_type'
+  # Used to store the chosen action for a per-arm model.
+  CHOSEN_ARM_FEATURES = 'chosen_arm_features'
 
 
 PolicyInfo = collections.namedtuple(  # pylint: disable=invalid-name
@@ -45,6 +47,60 @@ PolicyInfo = collections.namedtuple(  # pylint: disable=invalid-name
      InfoFields.BANDIT_POLICY_TYPE))
 # Set default empty tuple for all fields.
 PolicyInfo.__new__.__defaults__ = ((),) * len(PolicyInfo._fields)
+
+
+PerArmPolicyInfo = collections.namedtuple(  # pylint: disable=invalid-name
+    'PerArmPolicyInfo',
+    (policy_step.CommonFields.LOG_PROBABILITY,
+     InfoFields.PREDICTED_REWARDS_MEAN,
+     InfoFields.PREDICTED_REWARDS_SAMPLED,
+     InfoFields.BANDIT_POLICY_TYPE,
+     InfoFields.CHOSEN_ARM_FEATURES))
+# Set default empty tuple for all fields.
+PerArmPolicyInfo.__new__.__defaults__ = ((),) * len(PerArmPolicyInfo._fields)
+
+
+def populate_policy_info(arm_observations, chosen_actions, rewards_for_argmax,
+                         est_rewards, emit_policy_info,
+                         accepts_per_arm_features):
+  """Populates policy info given all needed input.
+
+  Args:
+    arm_observations: In case the policy accepts per-arm feautures, this is a
+      Tensor with the per-arm features. Otherwise its value is unused.
+    chosen_actions: A Tensor with the indices of the chosen actions.
+    rewards_for_argmax: The sampled or optimistically boosted reward estimates
+      based on which the policy chooses the action greedily.
+    est_rewards: A Tensor with the rewards estimated by the model.
+    emit_policy_info: A set of policy info keys, specifying wich info fields to
+      populate
+    accepts_per_arm_features: (bool) Whether the policy accepts per-arm
+      features.
+
+  Returns:
+    A policy info.
+  """
+  if accepts_per_arm_features:
+    # Saving the features for the chosen action to the policy_info.
+    chosen_arm_features = tf.gather(
+        params=arm_observations, indices=chosen_actions, batch_dims=1)
+    policy_info = PerArmPolicyInfo(
+        predicted_rewards_sampled=(
+            rewards_for_argmax if
+            InfoFields.PREDICTED_REWARDS_SAMPLED in emit_policy_info else ()),
+        predicted_rewards_mean=(
+            est_rewards
+            if InfoFields.PREDICTED_REWARDS_MEAN in emit_policy_info else ()),
+        chosen_arm_features=chosen_arm_features)
+  else:
+    policy_info = PolicyInfo(
+        predicted_rewards_sampled=(
+            rewards_for_argmax if
+            InfoFields.PREDICTED_REWARDS_SAMPLED in emit_policy_info else ()),
+        predicted_rewards_mean=(
+            est_rewards
+            if InfoFields.PREDICTED_REWARDS_MEAN in emit_policy_info else ()))
+  return policy_info
 
 
 class BanditPolicyType(object):
@@ -69,6 +125,9 @@ def create_bandit_policy_type_tensor_spec(shape):
 def masked_argmax(input_tensor, mask, output_type=tf.int32):
   """Computes the argmax where the allowed elements are given by a mask.
 
+  If a row of `mask` contains all zeros, then this method will return -1 for the
+  corresponding row of `input_tensor`.
+
   Args:
     input_tensor: Rank-2 Tensor of floats.
     mask: 0-1 valued Tensor of the same shape as input.
@@ -80,11 +139,13 @@ def masked_argmax(input_tensor, mask, output_type=tf.int32):
   """
   input_tensor.shape.assert_is_compatible_with(mask.shape)
   neg_inf = tf.constant(-float('Inf'), input_tensor.dtype)
-  tf.compat.v1.assert_equal(
-      tf.reduce_max(mask, axis=1), tf.constant(1, dtype=mask.dtype))
   modified_input = tf.compat.v2.where(
       tf.cast(mask, tf.bool), input_tensor, neg_inf)
-  return tf.argmax(modified_input, axis=-1, output_type=output_type)
+  argmax_tensor = tf.argmax(modified_input, axis=-1, output_type=output_type)
+  # Replace results for invalid mask rows with -1.
+  reduce_mask = tf.cast(tf.reduce_max(mask, axis=1), tf.bool)
+  neg_one = tf.constant(-1, output_type)
+  return tf.compat.v2.where(reduce_mask, argmax_tensor, neg_one)
 
 
 def has_bandit_policy_type(info, check_for_tensor=False):
@@ -141,6 +202,36 @@ def bandit_policy_uniform_mask(values, mask):
   Returns:
     Tensor containing `BanditPolicyType` enumerations with masked values.
   """
-  tf.compat.v1.assert_equal(tf.shape(mask), tf.shape(values))
   return tf.where(
       mask, tf.fill(tf.shape(values), BanditPolicyType.UNIFORM), values)
+
+
+def get_model_index(arm_index, accepts_per_arm_features):
+  """Returns the model index for a specific arm.
+
+  The number of models depends on the observation format: If the policy accepts
+  per-arm features, there is only one single model used for every arm. Otherwise
+  there is a model for every arm.
+
+  Args:
+    arm_index: The index of the arm for which the model index is needed.
+    accepts_per_arm_features: (bool) Whether the policy works with per-arm
+      features.
+
+  Returns:
+    The index of the model for the arm requested.
+  """
+  return 0 if accepts_per_arm_features else arm_index
+
+
+def compute_feasibility_probability(observation, constraints, batch_size,
+                                    num_actions, action_mask=None):
+  """Helper function to compute the action feasibility probability."""
+  feasibility_prob = tf.ones([batch_size, num_actions])
+  if action_mask is not None:
+    feasibility_prob = tf.cast(action_mask, tf.float32)
+  for c in constraints:
+    # We assume the constraints are independent.
+    action_feasibility = c(observation)
+    feasibility_prob *= action_feasibility
+  return feasibility_prob

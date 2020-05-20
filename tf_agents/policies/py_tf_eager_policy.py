@@ -32,7 +32,7 @@ from tf_agents.utils import nest_utils
 
 
 @gin.configurable
-class PyTFEagerPolicyBase(py_policy.Base):
+class PyTFEagerPolicyBase(py_policy.PyPolicy):
   """Base class for py_policy instances of TF policies in Eager mode.
 
   Handles adding and removing batch dimensions from the actions and time_steps.
@@ -157,6 +157,10 @@ class SavedModelPyTFEagerPolicy(PyTFEagerPolicyBase):
   def get_train_step(self):
     """Returns the training global step of the saved model."""
     return self._policy.get_train_step().numpy()
+
+  def get_metadata(self):
+    """Returns the metadata of the saved model."""
+    return self._policy.get_metadata()
 
   def variables(self):
     return self._policy.model_variables

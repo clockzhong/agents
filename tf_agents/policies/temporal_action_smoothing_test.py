@@ -32,7 +32,7 @@ from tf_agents.trajectories import time_step as ts
 from tf_agents.utils import test_utils
 
 
-class StateIncrementPolicy(tf_policy.Base):
+class StateIncrementPolicy(tf_policy.TFPolicy):
 
   def __init__(self, time_step_spec, action_spec):
     super(StateIncrementPolicy, self).__init__(
@@ -56,7 +56,8 @@ class TemporalActionSmoothingTest(parameterized.TestCase, test_utils.TestCase):
 
   @property
   def _time_step(self):
-    return ts.transition(tf.constant([[1, 2]], dtype=tf.float32), reward=[1.])
+    return ts.transition(tf.constant([[1, 2]], dtype=tf.float32),
+                         reward=tf.constant([1.]))
 
   def testStateIncrementPolicy(self):
     policy = StateIncrementPolicy(self._time_step_spec, self._action_spec)

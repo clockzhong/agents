@@ -21,7 +21,6 @@ from __future__ import print_function
 
 import collections
 import functools
-import multiprocessing.dummy as dummy_multiprocessing
 import time
 
 import numpy as np
@@ -30,6 +29,7 @@ import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
 from tf_agents.environments import parallel_py_environment
 from tf_agents.environments import random_py_environment
 from tf_agents.specs import array_spec
+from tf_agents.system import system_multiprocessing as multiprocessing
 from tf_agents.trajectories import time_step as ts
 
 
@@ -42,9 +42,6 @@ class SlowStartingEnvironment(random_py_environment.RandomPyEnvironment):
 
 
 class ParallelPyEnvironmentTest(tf.test.TestCase):
-
-  def setUp(self):
-    parallel_py_environment.multiprocessing = dummy_multiprocessing
 
   def _set_default_specs(self):
     self.observation_spec = array_spec.ArraySpec((3, 3), np.float32)
@@ -187,11 +184,11 @@ class ParallelPyEnvironmentTest(tf.test.TestCase):
     env.seed(seeds)
     self.assertEqual(
         np.random.RandomState(0).get_state()[1][-1],
-        env._envs[0]._rng.get_state()[1][-1])
+        env._envs[0].access('_rng').get_state()[1][-1])
 
     self.assertEqual(
         np.random.RandomState(1).get_state()[1][-1],
-        env._envs[1]._rng.get_state()[1][-1])
+        env._envs[1].access('_rng').get_state()[1][-1])
     env.close()
 
 
@@ -297,4 +294,4 @@ class MockEnvironmentCrashInStep(random_py_environment.RandomPyEnvironment):
 
 
 if __name__ == '__main__':
-  tf.test.main()
+  multiprocessing.handle_test_main(tf.test.main)

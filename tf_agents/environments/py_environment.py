@@ -24,8 +24,10 @@ from __future__ import division
 from __future__ import print_function
 
 import abc
+import numpy as np
 import six
 
+from tf_agents.specs import array_spec
 from tf_agents.trajectories import time_step as ts
 from tf_agents.utils import common
 
@@ -106,6 +108,29 @@ class PyEnvironment(object):
       An `ArraySpec`, or a nested dict, list or tuple of `ArraySpec`s.
     """
 
+  def reward_spec(self):
+    """Defines the rewards that are returned by `step()`.
+
+    Override this method to define an environment that uses non-standard reward
+    values, for example an environment with array-valued rewards.
+
+    Returns:
+      An `ArraySpec`, or a nested dict, list or tuple of `ArraySpec`s.
+    """
+    return array_spec.ArraySpec(shape=(), dtype=np.float32, name='reward')
+
+  def discount_spec(self):
+    """Defines the discount that are returned by `step()`.
+
+    Override this method to define an environment that uses non-standard
+    discount values, for example an environment with array-valued discounts.
+
+    Returns:
+      An `ArraySpec`, or a nested dict, list or tuple of `ArraySpec`s.
+    """
+    return array_spec.BoundedArraySpec(
+        shape=(), dtype=np.float32, minimum=0., maximum=1., name='discount')
+
   def time_step_spec(self):
     """Describes the `TimeStep` fields returned by `step()`.
 
@@ -117,7 +142,7 @@ class PyEnvironment(object):
       A `TimeStep` namedtuple containing (possibly nested) `ArraySpec`s defining
       the step_type, reward, discount, and observation structure.
     """
-    return ts.time_step_spec(self.observation_spec())
+    return ts.time_step_spec(self.observation_spec(), self.reward_spec())
 
   def current_time_step(self):
     """Returns the current timestep."""
@@ -253,6 +278,10 @@ class PyEnvironment(object):
     Callers should not assume anything about the contents or format of the
     returned `state`. It should be treated as a token that can be passed back to
     `set_state()` later.
+
+    Note that the returned `state` handle should not be modified by the
+    environment later on, and ensuring this (e.g. using copy.deepcopy) is the
+    responsibility of the environment.
 
     Returns:
       state: The current state of the environment.

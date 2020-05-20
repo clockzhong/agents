@@ -30,7 +30,7 @@ from tf_agents.utils import nest_utils
 from tf_agents.utils import session_utils
 
 
-class PyTFPolicy(py_policy.Base, session_utils.SessionUser):
+class PyTFPolicy(py_policy.PyPolicy, session_utils.SessionUser):
   """Exposes a Python policy as wrapper over a TF Policy."""
 
   # TODO(damienv): currently, the initial policy state must be batched
@@ -43,12 +43,12 @@ class PyTFPolicy(py_policy.Base, session_utils.SessionUser):
     """Initializes a new `PyTFPolicy`.
 
     Args:
-      policy: A TF Policy implementing `tf_policy.Base`.
+      policy: A TF Policy implementing `tf_policy.TFPolicy`.
       batch_size: (deprecated)
       seed: Seed to use if policy performs random actions (optional).
     """
-    if not isinstance(policy, tf_policy.Base):
-      logging.warning('Policy should implement tf_policy.Base')
+    if not isinstance(policy, tf_policy.TFPolicy):
+      logging.warning('Policy should implement tf_policy.TFPolicy')
 
     if batch_size is not None:
       logging.warning('In PyTFPolicy constructor, `batch_size` is deprecated, '
@@ -197,7 +197,7 @@ class PyTFPolicy(py_policy.Base, session_utils.SessionUser):
       # update time_step.
       time_step = nest_utils.batch_nested_array(time_step)
 
-    tf.nest.assert_same_structure(self._time_step, time_step)
+    nest_utils.assert_same_structure(self._time_step, time_step)
     feed_dict = {self._time_step: time_step}
     if policy_state is not None:
       # Flatten policy_state to handle specs that are not hashable due to lists.
