@@ -20,7 +20,10 @@ TODO(kbanoop): Make policy state optional in the action method.
 
 from __future__ import absolute_import
 from __future__ import division
+# Using Type Annotations.
 from __future__ import print_function
+
+from typing import Optional, Text
 
 import gin
 import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
@@ -31,6 +34,7 @@ from tf_agents.policies import greedy_policy
 from tf_agents.policies import random_tf_policy
 from tf_agents.policies import tf_policy
 from tf_agents.trajectories import policy_step
+from tf_agents.typing import types
 from tf_agents.utils import nest_utils
 
 tfd = tfp.distributions
@@ -40,7 +44,10 @@ tfd = tfp.distributions
 class EpsilonGreedyPolicy(tf_policy.TFPolicy):
   """Returns epsilon-greedy samples of a given policy."""
 
-  def __init__(self, policy, epsilon, name=None):
+  def __init__(self,
+               policy: tf_policy.TFPolicy,
+               epsilon: types.FloatOrReturningFloat,
+               name: Optional[Text] = None):
     """Builds an epsilon-greedy MixturePolicy wrapping the given policy.
 
     Args:
@@ -53,10 +60,15 @@ class EpsilonGreedyPolicy(tf_policy.TFPolicy):
     Raises:
       ValueError: If epsilon is invalid.
     """
-    observation_and_action_constraint_splitter = getattr(
-        policy, 'observation_and_action_constraint_splitter', None)
-    accepts_per_arm_features = getattr(policy, 'accepts_per_arm_features',
-                                       False)
+    try:
+      observation_and_action_constraint_splitter = (
+          policy.observation_and_action_constraint_splitter)
+    except AttributeError:
+      observation_and_action_constraint_splitter = None
+    try:
+      accepts_per_arm_features = policy.accepts_per_arm_features
+    except AttributeError:
+      accepts_per_arm_features = False
     self._greedy_policy = greedy_policy.GreedyPolicy(policy)
     self._epsilon = epsilon
     self._random_policy = random_tf_policy.RandomTFPolicy(
@@ -78,7 +90,7 @@ class EpsilonGreedyPolicy(tf_policy.TFPolicy):
         name=name)
 
   @property
-  def wrapped_policy(self):
+  def wrapped_policy(self) -> tf_policy.TFPolicy:
     return self._greedy_policy.wrapped_policy
 
   def _variables(self):
@@ -115,7 +127,27 @@ class EpsilonGreedyPolicy(tf_policy.TFPolicy):
     if greedy_action.info:
       if not random_action.info:
         raise ValueError('Incompatible info field')
-      info = nest_utils.where(cond, greedy_action.info, random_action.info)
+      # Note that the objects in PolicyInfo may have different shapes, so we
+      # need to call nest_utils.where() on each type of object.
+      info = tf.nest.map_structure(lambda x, y: nest_utils.where(cond, x, y),
+                                   greedy_action.info, random_action.info)
+      if self._emit_log_probability:
+        # At this point, info.log_probability contains the log prob of the
+        # action chosen, conditioned on the policy that was chosen. We want to
+        # emit the full log probability of the action, so we'll add in the log
+        # probability of choosing the policy.
+        random_log_prob = tf.nest.map_structure(
+            lambda t: tf.math.log(tf.zeros_like(t) + self._get_epsilon()),
+            info.log_probability)
+        greedy_log_prob = tf.nest.map_structure(
+            lambda t: tf.math.log(tf.ones_like(t) - self._get_epsilon()),
+            random_log_prob)
+        log_prob_of_chosen_policy = nest_utils.where(cond, greedy_log_prob,
+                                                     random_log_prob)
+        log_prob = tf.nest.map_structure(lambda a, b: a + b,
+                                         log_prob_of_chosen_policy,
+                                         info.log_probability)
+        info = policy_step.set_log_probability(info, log_prob)
       # Overwrite bandit policy info type.
       if policy_utilities.has_bandit_policy_type(info, check_for_tensor=True):
         # Generate mask of the same shape as bandit_policy_type (batch_size, 1).

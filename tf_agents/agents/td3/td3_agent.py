@@ -26,17 +26,23 @@ For the full paper, see https://arxiv.org/abs/1802.09477.
 
 from __future__ import absolute_import
 from __future__ import division
+# Using Type Annotations.
 from __future__ import print_function
 
 import collections
+from typing import Optional, Text
+
 import gin
 import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
 import tensorflow_probability as tfp
 
 from tf_agents.agents import tf_agent
+from tf_agents.networks import network
 from tf_agents.policies import actor_policy
 from tf_agents.policies import gaussian_policy
+from tf_agents.trajectories import time_step as ts
 from tf_agents.trajectories import trajectory
+from tf_agents.typing import types
 from tf_agents.utils import common
 from tf_agents.utils import eager_utils
 from tf_agents.utils import nest_utils
@@ -53,31 +59,30 @@ class Td3Agent(tf_agent.TFAgent):
   """A TD3 Agent."""
 
   def __init__(self,
-               time_step_spec,
-               action_spec,
-               actor_network,
-               critic_network,
-               actor_optimizer,
-               critic_optimizer,
-               exploration_noise_std=0.1,
-               critic_network_2=None,
-               target_actor_network=None,
-               target_critic_network=None,
-               target_critic_network_2=None,
-               target_update_tau=1.0,
-               target_update_period=1,
-               actor_update_period=1,
-               dqda_clipping=None,
-               td_errors_loss_fn=None,
-               gamma=1.0,
-               reward_scale_factor=1.0,
-               target_policy_noise=0.2,
-               target_policy_noise_clip=0.5,
-               gradient_clipping=None,
-               debug_summaries=False,
-               summarize_grads_and_vars=False,
-               train_step_counter=None,
-               name=None):
+               time_step_spec: ts.TimeStep,
+               action_spec: types.NestedTensor,
+               actor_network: network.Network,
+               critic_network: network.Network,
+               actor_optimizer: types.Optimizer,
+               critic_optimizer: types.Optimizer,
+               exploration_noise_std: types.Float = 0.1,
+               critic_network_2: Optional[network.Network] = None,
+               target_actor_network: Optional[network.Network] = None,
+               target_critic_network: Optional[network.Network] = None,
+               target_critic_network_2: Optional[network.Network] = None,
+               target_update_tau: types.Float = 1.0,
+               target_update_period: types.Int = 1,
+               actor_update_period: types.Int = 1,
+               td_errors_loss_fn: Optional[types.LossFn] = None,
+               gamma: types.Float = 1.0,
+               reward_scale_factor: types.Float = 1.0,
+               target_policy_noise: types.Float = 0.2,
+               target_policy_noise_clip: types.Float = 0.5,
+               gradient_clipping: Optional[types.Float] = None,
+               debug_summaries: bool = False,
+               summarize_grads_and_vars: bool = False,
+               train_step_counter: Optional[tf.Variable] = None,
+               name: Text = None):
     """Creates a Td3Agent Agent.
 
     Args:
@@ -116,9 +121,6 @@ class Td3Agent(tf_agent.TFAgent):
       target_update_tau: Factor for soft update of the target networks.
       target_update_period: Period for soft update of the target networks.
       actor_update_period: Period for the optimization step on actor network.
-      dqda_clipping: A scalar or float clips the gradient dqda element-wise
-        between [-dqda_clipping, dqda_clipping]. Default is None representing no
-        clippiing.
       td_errors_loss_fn:  A function for computing the TD errors loss. If None,
         a default value of elementwise huber_loss is used.
       gamma: A discount factor for future rewards.
@@ -172,7 +174,6 @@ class Td3Agent(tf_agent.TFAgent):
     self._target_update_tau = target_update_tau
     self._target_update_period = target_update_period
     self._actor_update_period = actor_update_period
-    self._dqda_clipping = dqda_clipping
     self._td_errors_loss_fn = (
         td_errors_loss_fn or common.element_wise_huber_loss)
     self._gamma = gamma
@@ -241,7 +242,6 @@ class Td3Agent(tf_agent.TFAgent):
     with tf.name_scope('update_targets'):
 
       def update():  # pylint: disable=missing-docstring
-        # TODO(b/124381161): What about observation normalizer variables?
         critic_update_1 = common.soft_variables_update(
             self._critic_network_1.variables,
             self._target_critic_network_1.variables,
@@ -337,9 +337,12 @@ class Td3Agent(tf_agent.TFAgent):
 
     return optimizer.apply_gradients(grads_and_vars)
 
-  @common.function
-  def critic_loss(self, time_steps, actions, next_time_steps, weights=None,
-                  training=False):
+  def critic_loss(self,
+                  time_steps: ts.TimeStep,
+                  actions: types.Tensor,
+                  next_time_steps: ts.TimeStep,
+                  weights: Optional[types.Tensor] = None,
+                  training: bool = False) -> types.Tensor:
     """Computes the critic loss for TD3 training.
 
     Args:
@@ -466,8 +469,10 @@ class Td3Agent(tf_agent.TFAgent):
 
       return tf.reduce_mean(input_tensor=critic_loss)
 
-  @common.function
-  def actor_loss(self, time_steps, weights=None, training=False):
+  def actor_loss(self,
+                 time_steps: ts.TimeStep,
+                 weights: types.Tensor = None,
+                 training: bool = False) -> types.Tensor:
     """Computes the actor_loss for TD3 training.
 
     Args:
@@ -483,32 +488,16 @@ class Td3Agent(tf_agent.TFAgent):
       actions, _ = self._actor_network(time_steps.observation,
                                        time_steps.step_type,
                                        training=training)
-      with tf.GradientTape(watch_accessed_variables=False) as tape:
-        tape.watch(actions)
-        q_values, _ = self._critic_network_1((time_steps.observation, actions),
-                                             time_steps.step_type,
-                                             training=False)
-        actions = tf.nest.flatten(actions)
 
-      dqdas = tape.gradient([q_values], actions)
-
-      actor_losses = []
-      for dqda, action in zip(dqdas, actions):
-        if self._dqda_clipping is not None:
-          dqda = tf.clip_by_value(dqda, -1 * self._dqda_clipping,
-                                  self._dqda_clipping)
-        loss = common.element_wise_squared_loss(
-            tf.stop_gradient(dqda + action), action)
-        if nest_utils.is_batched_nested_tensors(
-            time_steps, self.time_step_spec, num_outer_dims=2):
-          # Sum over the time dimension.
-          loss = tf.reduce_sum(loss, axis=1)
-        if weights is not None:
-          loss *= weights
-        loss = tf.reduce_mean(loss)
-        actor_losses.append(loss)
-
-      actor_loss = tf.add_n(actor_losses)
+      q_values, _ = self._critic_network_1((time_steps.observation, actions),
+                                           time_steps.step_type,
+                                           training=False)
+      actor_loss = -q_values
+      # Sum over the time dimension.
+      if actor_loss.shape.rank > 1:
+        actor_loss = tf.reduce_sum(actor_loss, axis=(1, actor_loss.shape.rank))
+      actor_loss = common.aggregate_losses(
+          per_example_loss=actor_loss, sample_weight=weights).total_loss
 
       with tf.name_scope('Losses/'):
         tf.compat.v2.summary.scalar(

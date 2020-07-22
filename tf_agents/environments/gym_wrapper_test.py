@@ -112,6 +112,28 @@ class GymWrapperSpecTest(test_utils.TestCase):
       np.testing.assert_array_equal(np.array([-1.0, -2.0]), spec.minimum)
       np.testing.assert_array_equal(np.array([2.0, 4.0]), spec.maximum)
 
+  def test_spec_from_gym_space_box_array_constant_bounds(self):
+    for dtype in (np.float32, np.float64):
+      box_space = gym.spaces.Box(
+          np.array([-1.0, -1.0]), np.array([2.0, 2.0]), dtype=dtype)
+      spec = gym_wrapper.spec_from_gym_space(box_space)
+
+      self.assertEqual((2,), spec.shape)
+      self.assertEqual(dtype, spec.dtype)
+      self.assertAllEqual(-1.0, spec.minimum)
+      self.assertAllEqual(2.0, spec.maximum)
+
+  def test_spec_from_gym_space_box_array_constant_min(self):
+    for dtype in (np.float32, np.float64):
+      box_space = gym.spaces.Box(
+          np.array([-1.0, -1.0]), np.array([2.0, 4.0]), dtype=dtype)
+      spec = gym_wrapper.spec_from_gym_space(box_space)
+
+      self.assertEqual((2,), spec.shape)
+      self.assertEqual(dtype, spec.dtype)
+      self.assertAllEqual([-1., -1.], spec.minimum)
+      self.assertAllEqual([2., 4.], spec.maximum)
+
   def test_spec_from_gym_space_tuple(self):
     tuple_space = gym.spaces.Tuple((gym.spaces.Discrete(2),
                                     gym.spaces.Discrete(3)))
@@ -376,14 +398,40 @@ class GymWrapperOnCartpoleTest(test_utils.TestCase):
     env = gym_wrapper.GymWrapper(cartpole_env)
     env.render()
     self.assertEqual(1, cartpole_env.render.call_count)
+    cartpole_env.render.assert_called_with('rgb_array')
     env.seed(0)
     self.assertEqual(1, cartpole_env.seed.call_count)
     cartpole_env.seed.assert_called_with(0)
     env.close()
     self.assertEqual(1, cartpole_env.close.call_count)
 
+  def test_render_kwargs(self):
+    cartpole_env = gym.spec('CartPole-v1').make()
+    def _gym_render_mock(mode='rgb_array', **kwargs):
+      del mode, kwargs  # unused
+      return None
+    cartpole_env.render = mock.MagicMock(side_effect=_gym_render_mock)
+
+    # The following are hypothetical (mocked) usages of render(),
+    # as the CartPole environment actually does not support kwargs for `render`.
+    env = gym_wrapper.GymWrapper(
+        cartpole_env, render_kwargs={'width': 96, 'height': 128})
+    env.render()
+    cartpole_env.render.assert_called_with('rgb_array', width=96, height=128)
+    env.render(mode='human')
+    cartpole_env.render.assert_called_with('human', width=96, height=128)
+
+    # In a corner case where kwargs includes mode (got multiple values for
+    # argument 'mode'), an exception will be thrown.
+    cartpole_env.render.reset_mock()
+    render_kwargs = dict(mode='human', width=96, height=128)
+    env = gym_wrapper.GymWrapper(cartpole_env, render_kwargs=render_kwargs)
+    with self.assertRaisesRegex(TypeError, 'multiple values'):
+      env.render()
+
   def test_obs_dtype(self):
     cartpole_env = gym.spec('CartPole-v1').make()
+    cartpole_env.render = mock.MagicMock()
     env = gym_wrapper.GymWrapper(cartpole_env)
     time_step = env.reset()
     self.assertEqual(env.observation_spec().dtype, time_step.observation.dtype)

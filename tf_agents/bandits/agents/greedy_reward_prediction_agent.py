@@ -31,7 +31,6 @@ from tf_agents.bandits.policies import greedy_reward_prediction_policy as greedy
 from tf_agents.bandits.specs import utils as bandit_spec_utils
 from tf_agents.utils import common
 from tf_agents.utils import eager_utils
-from tf_agents.utils import nest_utils
 
 
 @gin.configurable
@@ -195,26 +194,10 @@ class GreedyRewardPredictionAgent(tf_agent.TFAgent):
     return variables_to_train
 
   def _train(self, experience, weights):
-    rewards, _ = nest_utils.flatten_multi_batched_nested_tensors(
-        experience.reward, self._time_step_spec.reward)
-    actions, _ = nest_utils.flatten_multi_batched_nested_tensors(
-        experience.action, self._action_spec)
-    observations, _ = nest_utils.flatten_multi_batched_nested_tensors(
-        experience.observation, self.training_data_spec.observation)
-    if self._observation_and_action_constraint_splitter is not None:
-      observations, _ = self._observation_and_action_constraint_splitter(
-          observations)
-    if self._accepts_per_arm_features:
-      # The arm observation we train on needs to be copied from the respective
-      # policy info field to the per arm observation field. Pretending there was
-      # only one action, we fill the action field with zeros.
-      chosen_action, _ = nest_utils.flatten_multi_batched_nested_tensors(
-          experience.policy_info.chosen_arm_features,
-          self.policy.info_spec.chosen_arm_features)
-      observations[
-          bandit_spec_utils.PER_ARM_FEATURE_KEY] = tf.nest.map_structure(
-              lambda x: tf.expand_dims(x, axis=1), chosen_action)
-      actions = tf.zeros_like(actions)
+    (observations, actions,
+     rewards) = bandit_utils.process_experience_for_neural_agents(
+         experience, self._observation_and_action_constraint_splitter,
+         self._accepts_per_arm_features, self.training_data_spec)
 
     with tf.GradientTape() as tape:
       loss_info = self.loss(observations,
@@ -270,7 +253,7 @@ class GreedyRewardPredictionAgent(tf_agent.TFAgent):
         if the number of actions is greater than 1.
     """
     with tf.name_scope('loss'):
-      sample_weights = weights if weights else 1
+      sample_weights = weights if weights is not None else 1
       if self._heteroscedastic:
         predictions, _ = self._reward_network(observations,
                                               training=training)
@@ -324,9 +307,9 @@ class GreedyRewardPredictionAgent(tf_agent.TFAgent):
       observations: A batch of observations.
       actions: A batch of actions.
       rewards: A batch of rewards. In the case we have constraints, we assume
-        that rewards is a 2-rank tensor where the first column corresponds to
-        the reward signal and the following columns correspond to the
-        constraint signals.
+        that reward is a dict of tensors with 'reward' and 'constraint' keys
+        defined in 'bandit_spec_utils'. In case of many constraint signals, the
+        constraint tensor has many columns; one column per constraint signal.
       weights: Optional scalar or elementwise (per-batch-entry) importance
         weights.  The output batch loss will be scaled by these weights, and
         the final scalar loss is the mean of these values.
@@ -338,18 +321,23 @@ class GreedyRewardPredictionAgent(tf_agent.TFAgent):
       ValueError:
         if the number of actions is greater than 1.
     """
-    # We assume that the first column is the reward signal followed by the
-    # constraint signals.
-    rewards_tensor = rewards
     if self._constraints:
-      rewards_tensor = rewards[:, 0]
+      rewards_tensor = rewards[bandit_spec_utils.REWARD_SPEC_KEY]
+    else:
+      rewards_tensor = rewards
     reward_loss = self.reward_loss(
         observations, actions, rewards_tensor, weights, training)
 
     constraint_loss = tf.constant(0.0)
-    for i, c in enumerate(self._constraints, 1):
+    for i, c in enumerate(self._constraints, 0):
+      if self._time_step_spec.reward[
+          bandit_spec_utils.CONSTRAINTS_SPEC_KEY].shape.rank > 1:
+        constraint_targets = rewards[
+            bandit_spec_utils.CONSTRAINTS_SPEC_KEY][:, i]
+      else:
+        constraint_targets = rewards[bandit_spec_utils.CONSTRAINTS_SPEC_KEY]
       constraint_loss += c.compute_loss(
-          observations, actions, rewards[:, i], weights, training)
+          observations, actions, constraint_targets, weights, training)
 
     self.compute_summaries(reward_loss, constraint_loss=(
         constraint_loss if self._constraints else None))

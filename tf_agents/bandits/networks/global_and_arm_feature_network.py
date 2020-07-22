@@ -29,11 +29,32 @@ from tf_agents.networks import q_network
 from tf_agents.specs import tensor_spec
 
 
-def create_feed_forward_common_tower_network(observation_spec, global_layers,
-                                             arm_layers, common_layers,
-                                             output_dim=1,
-                                             global_preprocessing_combiner=None,
-                                             arm_preprocessing_combiner=None):
+def _remove_num_actions_dim_from_spec(observation_spec):
+  """Removes the extra `num_actions` dimension from the observation spec."""
+  obs_spec_no_num_actions = {
+      bandit_spec_utils.GLOBAL_FEATURE_KEY:
+          observation_spec[bandit_spec_utils.GLOBAL_FEATURE_KEY],
+      bandit_spec_utils.PER_ARM_FEATURE_KEY:
+          tensor_spec.remove_outer_dims_nest(
+              observation_spec[bandit_spec_utils.PER_ARM_FEATURE_KEY], 1)
+  }
+  if bandit_spec_utils.NUM_ACTIONS_FEATURE_KEY in observation_spec:
+    obs_spec_no_num_actions.update({
+        bandit_spec_utils.NUM_ACTIONS_FEATURE_KEY:
+            observation_spec[bandit_spec_utils.NUM_ACTIONS_FEATURE_KEY]
+    })
+  return obs_spec_no_num_actions
+
+
+def create_feed_forward_common_tower_network(
+    observation_spec,
+    global_layers,
+    arm_layers,
+    common_layers,
+    output_dim=1,
+    global_preprocessing_combiner=None,
+    arm_preprocessing_combiner=None,
+    activation_fn=tf.keras.activations.relu):
   """Creates a common tower network with feedforward towers.
 
   The network produced by this function can be used either in
@@ -55,21 +76,26 @@ def create_feed_forward_common_tower_network(observation_spec, global_layers,
       with the specified output dimension.
     global_preprocessing_combiner: Preprocessing combiner for global features.
     arm_preprocessing_combiner: Preprocessing combiner for the arm features.
+    activation_fn: A keras activation, specifying the activation function used
+      in all layers. Defaults to relu.
 
   Returns:
     A network that takes observations adhering observation_spec and outputs
     reward estimates for every action.
   """
+  obs_spec_no_num_actions = _remove_num_actions_dim_from_spec(observation_spec)
   global_network = encoding_network.EncodingNetwork(
-      input_tensor_spec=observation_spec[bandit_spec_utils.GLOBAL_FEATURE_KEY],
+      input_tensor_spec=obs_spec_no_num_actions[
+          bandit_spec_utils.GLOBAL_FEATURE_KEY],
       fc_layer_params=global_layers,
+      activation_fn=activation_fn,
       preprocessing_combiner=global_preprocessing_combiner)
 
-  arm_feature_spec = tensor_spec.remove_outer_dims_nest(
-      observation_spec[bandit_spec_utils.PER_ARM_FEATURE_KEY], 1)
   arm_network = encoding_network.EncodingNetwork(
-      input_tensor_spec=arm_feature_spec,
+      input_tensor_spec=obs_spec_no_num_actions[
+          bandit_spec_utils.PER_ARM_FEATURE_KEY],
       fc_layer_params=arm_layers,
+      activation_fn=activation_fn,
       preprocessing_combiner=arm_preprocessing_combiner)
   common_input_dim = global_layers[-1] + arm_layers[-1]
   common_input_spec = tensor_spec.TensorSpec(
@@ -79,17 +105,22 @@ def create_feed_forward_common_tower_network(observation_spec, global_layers,
         input_tensor_spec=common_input_spec,
         action_spec=tensor_spec.BoundedTensorSpec(
             shape=(), minimum=0, maximum=0, dtype=tf.int32),
-        fc_layer_params=common_layers)
+        fc_layer_params=common_layers,
+        activation_fn=activation_fn)
   else:
     common_network = encoding_network.EncodingNetwork(
         input_tensor_spec=common_input_spec,
-        fc_layer_params=list(common_layers) + [output_dim])
-  return GlobalAndArmCommonTowerNetwork(observation_spec, global_network,
+        fc_layer_params=list(common_layers) + [output_dim],
+        activation_fn=activation_fn)
+  return GlobalAndArmCommonTowerNetwork(obs_spec_no_num_actions, global_network,
                                         arm_network, common_network)
 
 
-def create_feed_forward_dot_product_network(observation_spec, global_layers,
-                                            arm_layers):
+def create_feed_forward_dot_product_network(
+    observation_spec,
+    global_layers,
+    arm_layers,
+    activation_fn=tf.keras.activations.relu):
   """Creates a dot product network with feedforward towers.
 
   Args:
@@ -98,6 +129,8 @@ def create_feed_forward_dot_product_network(observation_spec, global_layers,
     global_layers: Iterable of ints. Specifies the layers of the global tower.
     arm_layers: Iterable of ints. Specifies the layers of the arm tower. The
       last element of arm_layers has to be equal to that of global_layers.
+    activation_fn: A keras activation, specifying the activation function used
+      in all layers. Defaults to relu.
 
   Returns:
     A dot product network that takes observations adhering observation_spec and
@@ -110,16 +143,18 @@ def create_feed_forward_dot_product_network(observation_spec, global_layers,
   if arm_layers[-1] != global_layers[-1]:
     raise ValueError('Last layer size of global and arm layers should match.')
 
+  obs_spec_no_num_actions = _remove_num_actions_dim_from_spec(observation_spec)
   global_network = encoding_network.EncodingNetwork(
-      input_tensor_spec=observation_spec[bandit_spec_utils.GLOBAL_FEATURE_KEY],
-      fc_layer_params=global_layers)
-  one_dim_per_arm_obs = tensor_spec.TensorSpec(
-      shape=observation_spec[bandit_spec_utils.PER_ARM_FEATURE_KEY].shape[1:],
-      dtype=tf.float32)
+      input_tensor_spec=obs_spec_no_num_actions[
+          bandit_spec_utils.GLOBAL_FEATURE_KEY],
+      fc_layer_params=global_layers,
+      activation_fn=activation_fn)
   arm_network = encoding_network.EncodingNetwork(
-      input_tensor_spec=one_dim_per_arm_obs,
-      fc_layer_params=arm_layers)
-  return GlobalAndArmDotProductNetwork(observation_spec, global_network,
+      input_tensor_spec=obs_spec_no_num_actions[
+          bandit_spec_utils.PER_ARM_FEATURE_KEY],
+      fc_layer_params=arm_layers,
+      activation_fn=activation_fn)
+  return GlobalAndArmDotProductNetwork(obs_spec_no_num_actions, global_network,
                                        arm_network)
 
 
@@ -165,8 +200,9 @@ class GlobalAndArmCommonTowerNetwork(network.Network):
     arm_obs = observation[bandit_spec_utils.PER_ARM_FEATURE_KEY]
     arm_output, arm_state = self._arm_network(
         arm_obs, step_type=step_type, network_state=network_state)
-    if arm_output.shape.rank > 3:
-      arm_output = tf.squeeze(arm_output, axis=2)
+    arm_output_shape = tf.shape(arm_output)
+    arm_output = tf.reshape(
+        arm_output, shape=[arm_output_shape[0], -1, arm_output_shape[-1]])
 
     global_output, global_state = self._global_network(
         global_obs, step_type=step_type, network_state=network_state)

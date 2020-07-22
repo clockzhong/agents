@@ -69,6 +69,14 @@ class CreateCounterTest(test_utils.TestCase):
     self.evaluate(tf.compat.v1.global_variables_initializer())
     self.assertAllEqual(self.evaluate(var), [1, 2])
 
+  def testInitializerDType(self):
+    var = common.create_variable(
+        'var',
+        dtype=tf.int64,
+        initializer=tf.random_uniform_initializer(minval=0, maxval=1))
+    self.evaluate(tf.compat.v1.global_variables_initializer())
+    self.assertEqual(var.dtype, tf.int64)
+
 
 class SoftVariablesUpdateTest(test_utils.TestCase, parameterized.TestCase):
 
@@ -974,6 +982,94 @@ class NetworkVariableChecks(tf.test.TestCase):
     with self.assertRaisesRegexp(ValueError,
                                  'Variable dtypes or shapes do not match'):
       common.check_matching_networks(q_net_1, q_net_2)
+
+
+class AggregateLossTest(test_utils.TestCase):
+
+  def test_aggregate_losses_without_time_dimension(self):
+    per_example_loss = tf.constant([4., 2., 3.])
+    aggregated_losses = common.aggregate_losses(per_example_loss)
+    self.assertAlmostEqual(self.evaluate(aggregated_losses.total_loss), 3)
+
+  def test_aggregate_losses_without_time_dimension_with_weights(self):
+    per_example_loss = tf.constant([4., 2., 3.])
+    sample_weights = tf.constant([1., 1., 0.])
+    aggregated_losses = common.aggregate_losses(per_example_loss,
+                                                sample_weights)
+    self.assertAlmostEqual(self.evaluate(aggregated_losses.total_loss), 2)
+
+  def test_aggregate_losses_with_time_dimension(self):
+    per_example_loss = tf.constant([[4., 2., 3.], [1, 1, 1]])
+    aggregated_losses = common.aggregate_losses(per_example_loss)
+    expected_per_example_loss = (4 + 2 + 3 + 1 + 1 + 1) / 6
+    self.assertAlmostEqual(
+        self.evaluate(aggregated_losses.total_loss), expected_per_example_loss)
+
+  def test_aggregate_losses_with_time_dimension_with_weights(self):
+    per_example_loss = tf.constant([[4., 2., 3.], [1, 1, 1]])
+    sample_weights = tf.constant([[1., 1., 0.], [1, 1, 1]])
+    aggregated_losses = common.aggregate_losses(per_example_loss,
+                                                sample_weights)
+    expected_per_example_loss = (4 + 2 + 1 + 1 + 1) / 6
+    self.assertAlmostEqual(
+        self.evaluate(aggregated_losses.total_loss), expected_per_example_loss)
+
+  def test_aggregate_losses_with_time_dim_and_weights_with_batch_dim(self):
+    per_example_loss = tf.constant([[4., 2., 3.], [1, 1, 1]])
+    sample_weights = tf.constant([
+        1.,
+        0.,
+    ])
+    aggregated_losses = common.aggregate_losses(per_example_loss,
+                                                sample_weights)
+    expected_per_example_loss = (4 + 2 + 3) / 6
+    self.assertAlmostEqual(
+        self.evaluate(aggregated_losses.total_loss), expected_per_example_loss)
+
+  def test_aggregate_losses_with_time_dim_and_scalar_weights(self):
+    per_example_loss = tf.constant([[4., 2., 3.], [1, 1, 1]])
+    sample_weights = tf.constant(0.5)
+    aggregated_losses = common.aggregate_losses(per_example_loss,
+                                                sample_weights)
+    expected_per_example_loss = 0.5 * (4 + 2 + 3 + 1 + 1 + 1) / 6
+    self.assertAlmostEqual(
+        self.evaluate(aggregated_losses.total_loss), expected_per_example_loss)
+
+  def test_aggregate_losses_with_time_dim_and_float_weights(self):
+    per_example_loss = tf.constant([[4., 2., 3.], [1, 1, 1]])
+    sample_weights = 0.5
+    aggregated_losses = common.aggregate_losses(per_example_loss,
+                                                sample_weights)
+    expected_per_example_loss = 0.5 * (4 + 2 + 3 + 1 + 1 + 1) / 6
+    self.assertAlmostEqual(
+        self.evaluate(aggregated_losses.total_loss), expected_per_example_loss)
+
+  def test_aggregate_losses_three_dimensions(self):
+    per_example_loss = tf.constant([[[4., 2., 3.], [1, 1, 1]],
+                                    [[8., 4., 6.], [2, 2, 2]]])
+    aggregated_losses = common.aggregate_losses(per_example_loss)
+    expected_per_example_loss = (4 + 2 + 3 + 1 + 1 + 1 + 8 + 4 + 6 + 2 + 2 +
+                                 2) / 12
+    self.assertAlmostEqual(
+        self.evaluate(aggregated_losses.total_loss), expected_per_example_loss)
+
+  def test_aggregate_4d_losses_and_2d_weights(self):
+    per_example_loss = tf.constant([[[[4., 2., 3.], [1, 1, 1]],
+                                     [[8., 4., 6.], [2, 2, 2]]],
+                                    [[[4., 2., 3.], [1, 1, 1]],
+                                     [[8., 4., 6.], [2, 2, 2]]]])  # 2x2x2x3
+    sample_weights = tf.constant([[
+        1.,
+        0.,
+    ], [
+        0.,
+        0.,
+    ]])
+    aggregated_losses = common.aggregate_losses(per_example_loss,
+                                                sample_weights)
+    expected_per_example_loss = (4 + 2 + 3 + 1 + 1 + 1) / 24
+    self.assertAlmostEqual(
+        self.evaluate(aggregated_losses.total_loss), expected_per_example_loss)
 
 
 class LegacyTF1Test(test_utils.TestCase):

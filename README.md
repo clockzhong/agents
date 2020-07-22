@@ -13,8 +13,8 @@ running in the Cartpole environment. API documentation for the current stable
 release is on
 [tensorflow.org](https://www.tensorflow.org/agents/api_docs/python/tf_agents).
 
-**NOTE:** 0.5.0 RC0 is now available and was tested with Python3 and TensorFlow
-2.2. `pip install tf-agents==0.5.0rc0`.
+**NOTE:** 0.5.0 is now available and was tested with Python3 and TensorFlow 2.2.
+`pip install --upgrade tf-agents`.
 
 TF-Agents is under active development and interfaces may change at any time.
 Feedback and comments are welcome.
@@ -82,7 +82,7 @@ End-to-end examples training agents can be found under each agent directory.
 e.g.:
 
 *   DQN:
-    [`tf_agents/agents/dqn/examples/v1/train_eval_gym.py`](https://github.com/tensorflow/agents/tree/master/tf_agents/agents/dqn/examples/v1/train_eval_gym.py)
+    [`tf_agents/agents/dqn/examples/v2/train_eval.py`](https://github.com/tensorflow/agents/tree/master/tf_agents/agents/dqn/examples/v2/train_eval.py)
 
 <a id='Installation'></a>
 
@@ -95,19 +95,19 @@ GitHub clone.
 
 ### Stable
 
-Run the commands below to install the most recent stable release (0.4.0), which
-was tested with TensorFlow 2.1.x and and Python3. API documentation for the
+Run the commands below to install the most recent stable release (0.5.0), which
+was tested with TensorFlow 2.2.x and and Python3. API documentation for the
 release is on
 [tensorflow.org](https://www.tensorflow.org/agents/api_docs/python/tf_agents).
 
 ```bash
 pip install --user tf-agents
-pip install --user tensorflow==2.1.0
+pip install --user tensorflow==2.2.0
 
 # To get the matching examples and colabs
 git clone https://github.com/tensorflow/agents.git
 cd agents
-git checkout v0.4.0
+git checkout v0.5.0
 
 ```
 
@@ -166,6 +166,7 @@ last release compatible with Python 2.
 Release | Branch / Tag                                               | TensorFlow Version
 ------- | ---------------------------------------------------------- | ------------------
 Nightly | [master](https://github.com/tensorflow/agents)             | tf-nightly
+0.5.0   | [v0.5.0](https://github.com/tensorflow/agents/tree/v0.5.0) | 2.2.0
 0.4.0   | [v0.4.0](https://github.com/tensorflow/agents/tree/v0.4.0) | 2.1.0
 0.3.0   | [v0.3.0](https://github.com/tensorflow/agents/tree/v0.3.0) | 1.15.0 and 2.0.0
 
@@ -180,7 +181,7 @@ pip install tf-agents
 pip install tf-agents-nightly
 
 # Specific version
-pip install tf-agents==0.4.0rc0
+pip install tf-agents==0.4.0
 
 ```
 
@@ -201,10 +202,11 @@ If you use this code, please cite it as:
 ```
 @misc{TFAgents,
   title = {{TF-Agents}: A library for Reinforcement Learning in TensorFlow},
-  author = "{Sergio Guadarrama, Anoop Korattikara, Oscar Ramirez,
-    Pablo Castro, Ethan Holly, Sam Fishman, Ke Wang, Ekaterina Gonina, Neal Wu,
-    Efi Kokiopoulou, Luciano Sbaiz, Jamie Smith, Gábor Bartók, Jesse Berent,
-    Chris Harris, Vincent Vanhoucke, Eugene Brevdo}",
+  author = "{Sergio Guadarrama and Anoop Korattikara and Oscar Ramirez and
+     Pablo Castro and Ethan Holly and Sam Fishman and Ke Wang and
+     Ekaterina Gonina and Neal Wu and Efi Kokiopoulou and Luciano Sbaiz and
+     Jamie Smith and Gábor Bartók and Jesse Berent and Chris Harris and
+     Vincent Vanhoucke and Eugene Brevdo}",
   howpublished = {\url{https://github.com/tensorflow/agents}},
   url = "https://github.com/tensorflow/agents",
   year = 2018,

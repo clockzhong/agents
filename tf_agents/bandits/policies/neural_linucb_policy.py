@@ -19,7 +19,6 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-
 import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
 import tensorflow_probability as tfp
 from tf_agents.bandits.policies import linalg
@@ -70,6 +69,7 @@ class NeuralLinUCBPolicy(tf_policy.TFPolicy):
                emit_policy_info=(),
                emit_log_probability=False,
                accepts_per_arm_features=False,
+               distributed_use_reward_layer=False,
                observation_and_action_constraint_splitter=None,
                name=None):
     """Initializes `NeuralLinUCBPolicy`.
@@ -85,8 +85,8 @@ class NeuralLinUCBPolicy(tf_policy.TFPolicy):
         treated as a batch dimension in the reward layer.
       epsilon_greedy: (float) representing the probability of choosing a random
         action instead of the greedy action.
-      actions_from_reward_layer: (bool) whether to get actions from the reward
-        layer or from LinUCB.
+      actions_from_reward_layer: (boolean variable) whether to get actions from
+        the reward layer or from LinUCB.
       cov_matrix: list of the covariance matrices. There exists one covariance
         matrix per arm, unless the policy accepts per-arm features, in which
         case this list must have a single element.
@@ -105,6 +105,10 @@ class NeuralLinUCBPolicy(tf_policy.TFPolicy):
       emit_log_probability: (bool) whether to emit log probabilities.
       accepts_per_arm_features: (bool) Whether the policy accepts per-arm
         features.
+      distributed_use_reward_layer: (bool) Whether to pick the actions using
+        the network or use LinUCB. This applies only in distributed training
+        setting and has a similar role to the `actions_from_reward_layer`
+        mentioned above.
       observation_and_action_constraint_splitter: A function used for masking
         valid/invalid actions with each state of the environment. The function
         takes in a full observation and returns a tuple consisting of 1) the
@@ -140,6 +144,7 @@ class NeuralLinUCBPolicy(tf_policy.TFPolicy):
     self._actions_from_reward_layer = actions_from_reward_layer
     self._epsilon_greedy = epsilon_greedy
     self._dtype = self._data_vector[0].dtype
+    self._distributed_use_reward_layer = distributed_use_reward_layer
 
     if len(cov_matrix) != len(data_vector):
       raise ValueError('The size of list cov_matrix must match the size of '
@@ -159,15 +164,12 @@ class NeuralLinUCBPolicy(tf_policy.TFPolicy):
     else:
       context_spec = time_step_spec.observation
     if accepts_per_arm_features:
-      self._num_actions = context_spec[
-          bandit_spec_utils.PER_ARM_FEATURE_KEY].shape.as_list()[0]
+      self._num_actions = tf.nest.flatten(context_spec[
+          bandit_spec_utils.PER_ARM_FEATURE_KEY])[0].shape.as_list()[0]
       self._num_models = 1
     else:
       self._num_actions = len(cov_matrix)
       self._num_models = self._num_actions
-    (self._global_context_dim,
-     self._arm_context_dim) = bandit_spec_utils.get_context_dims_from_spec(
-         context_spec, accepts_per_arm_features)
     cov_matrix_dim = tf.compat.dimension_value(cov_matrix[0].shape[0])
     if self._encoding_dim != cov_matrix_dim:
       raise ValueError('The dimension of matrix `cov_matrix` must match '
@@ -193,17 +195,25 @@ class NeuralLinUCBPolicy(tf_policy.TFPolicy):
       predicted_rewards_mean = tensor_spec.TensorSpec(
           [self._num_actions],
           dtype=tf.float32)
+    predicted_rewards_optimistic = ()
+    if (policy_utilities.InfoFields.PREDICTED_REWARDS_OPTIMISTIC in
+        emit_policy_info):
+      predicted_rewards_optimistic = tensor_spec.TensorSpec(
+          [self._num_actions],
+          dtype=tf.float32)
     if accepts_per_arm_features:
-      chosen_arm_features_info = tensor_spec.TensorSpec(
-          dtype=tf.float32,
-          shape=[self._arm_context_dim],
-          name='chosen_arm_features')
+      chosen_arm_features_info_spec = (
+          policy_utilities.create_chosen_arm_features_info_spec(
+              time_step_spec.observation,
+              observation_and_action_constraint_splitter))
       info_spec = policy_utilities.PerArmPolicyInfo(
           predicted_rewards_mean=predicted_rewards_mean,
-          chosen_arm_features=chosen_arm_features_info)
+          predicted_rewards_optimistic=predicted_rewards_optimistic,
+          chosen_arm_features=chosen_arm_features_info_spec)
     else:
       info_spec = policy_utilities.PolicyInfo(
-          predicted_rewards_mean=predicted_rewards_mean)
+          predicted_rewards_mean=predicted_rewards_mean,
+          predicted_rewards_optimistic=predicted_rewards_optimistic)
 
     super(NeuralLinUCBPolicy, self).__init__(
         time_step_spec=time_step_spec,
@@ -224,7 +234,8 @@ class NeuralLinUCBPolicy(tf_policy.TFPolicy):
 
   def _get_actions_from_reward_layer(self, encoded_observation, mask):
     # Get the predicted expected reward.
-    est_mean_reward = self._reward_layer(encoded_observation)
+    est_mean_reward = tf.reshape(self._reward_layer(encoded_observation),
+                                 shape=[-1, self._num_actions])
     if mask is None:
       greedy_actions = tf.argmax(est_mean_reward, axis=-1, output_type=tf.int32)
     else:
@@ -251,7 +262,7 @@ class NeuralLinUCBPolicy(tf_policy.TFPolicy):
     else:
       chosen_actions = greedy_actions
 
-    return chosen_actions, est_mean_reward
+    return chosen_actions, est_mean_reward, est_mean_reward
 
   def _get_actions_from_linucb(self, encoded_observation, mask):
     encoded_observation = tf.cast(encoded_observation, dtype=self._dtype)
@@ -288,7 +299,8 @@ class NeuralLinUCBPolicy(tf_policy.TFPolicy):
           stacked_p_values, mask, output_type=tf.int32)
 
     est_mean_reward = tf.cast(tf.stack(est_rewards, axis=-1), tf.float32)
-    return chosen_actions, est_mean_reward
+    return chosen_actions, est_mean_reward, tf.cast(stacked_p_values,
+                                                    tf.float32)
 
   def _distribution(self, time_step, policy_state):
     raise NotImplementedError(
@@ -296,55 +308,39 @@ class NeuralLinUCBPolicy(tf_policy.TFPolicy):
 
   def _action(self, time_step, policy_state, seed):
     observation = time_step.observation
-    mask = None
-    observation_and_action_constraint_splitter = (
-        self.observation_and_action_constraint_splitter)
-    if observation_and_action_constraint_splitter is not None:
-      observation, mask = observation_and_action_constraint_splitter(
+    if self.observation_and_action_constraint_splitter is not None:
+      observation, _ = self.observation_and_action_constraint_splitter(
           observation)
-    self._check_observation_shape(observation)
-    observation = tf.nest.map_structure(lambda t: tf.cast(t, dtype=self._dtype),
-                                        observation)
-
+    mask = policy_utilities.construct_mask_from_multiple_sources(
+        time_step.observation, self._observation_and_action_constraint_splitter,
+        (), self._num_actions)
     # Pass the observations through the encoding network.
     encoded_observation, _ = self._encoding_network(observation)
+    encoded_observation = tf.cast(encoded_observation, dtype=self._dtype)
 
-    chosen_actions, est_mean_rewards = tf.cond(
-        self._actions_from_reward_layer,
-        lambda: self._get_actions_from_reward_layer(encoded_observation, mask),
-        lambda: self._get_actions_from_linucb(encoded_observation, mask))
+    if tf.distribute.has_strategy():
+      if self._distributed_use_reward_layer:
+        chosen_actions, est_mean_rewards, est_rewards_optimistic = (
+            self._get_actions_from_reward_layer(encoded_observation, mask))
+      else:
+        chosen_actions, est_mean_rewards, est_rewards_optimistic = (
+            self._get_actions_from_linucb(encoded_observation, mask))
+    else:
+      chosen_actions, est_mean_rewards, est_rewards_optimistic = tf.cond(
+          self._actions_from_reward_layer,
+          # pylint: disable=g-long-lambda
+          lambda: self._get_actions_from_reward_layer(
+              encoded_observation, mask),
+          lambda: self._get_actions_from_linucb(encoded_observation, mask))
 
     arm_observations = ()
     if self._accepts_per_arm_features:
       arm_observations = observation[bandit_spec_utils.PER_ARM_FEATURE_KEY]
     policy_info = policy_utilities.populate_policy_info(
-        arm_observations, chosen_actions, (), est_mean_rewards,
-        self._emit_policy_info, self._accepts_per_arm_features)
+        arm_observations, chosen_actions, est_rewards_optimistic,
+        est_mean_rewards, self._emit_policy_info,
+        self._accepts_per_arm_features)
     return policy_step.PolicyStep(chosen_actions, policy_state, policy_info)
-
-  def _check_observation_shape(self, observation):
-    if self._accepts_per_arm_features:
-      if not observation[
-          bandit_spec_utils.GLOBAL_FEATURE_KEY].shape.is_compatible_with(
-              [None, self._global_context_dim]):
-        raise ValueError(
-            'Global observation shape is expected to be {}. Got {}.'.format(
-                [None, self._global_context_dim], observation[
-                    bandit_spec_utils.GLOBAL_FEATURE_KEY].shape.as_list()))
-      if not observation[
-          bandit_spec_utils.PER_ARM_FEATURE_KEY].shape.is_compatible_with(
-              [None, self._num_actions, self._arm_context_dim]):
-        raise ValueError(
-            'Arm observation shape is expected to be {}. Got {}.'.format(
-                [None, self._num_actions, self._arm_context_dim],
-                observation[
-                    bandit_spec_utils.PER_ARM_FEATURE_KEY].shape.as_list()))
-    else:
-      if not observation.shape.is_compatible_with(
-          [None, self._global_context_dim]):
-        raise ValueError(
-            'Observation shape is expected to be {}. Got {}.'.format(
-                [None, self._global_context_dim], observation.shape.as_list()))
 
   def _get_encoded_observation_for_arm(self, encoded_observation, arm_index):
     if self._accepts_per_arm_features:

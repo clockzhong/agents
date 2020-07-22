@@ -21,7 +21,11 @@ from __future__ import print_function
 
 import collections
 
+from absl import logging
 import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
+import tensorflow_probability as tfp
+
+from tf_agents.bandits.specs import utils as bandit_spec_utils
 from tf_agents.specs import tensor_spec
 from tf_agents.trajectories import policy_step
 from tf_agents.utils import common
@@ -29,8 +33,11 @@ from tf_agents.utils import common
 
 class InfoFields(object):
   """Strings which can be used in the policy info fields."""
+  LOG_PROBABILITY = policy_step.CommonFields.LOG_PROBABILITY
   # Mean of predicted rewards (per arm).
   PREDICTED_REWARDS_MEAN = 'predicted_rewards_mean'
+  # Optimistic estimates of predicted rewards (per arm).
+  PREDICTED_REWARDS_OPTIMISTIC = 'predicted_rewards_optimistic'
   # Samples of predicted rewards (per arm).
   PREDICTED_REWARDS_SAMPLED = 'predicted_rewards_sampled'
   # Type of bandit policy (see enumerations in `BanditPolicyType`).
@@ -41,8 +48,9 @@ class InfoFields(object):
 
 PolicyInfo = collections.namedtuple(  # pylint: disable=invalid-name
     'PolicyInfo',
-    (policy_step.CommonFields.LOG_PROBABILITY,
+    (InfoFields.LOG_PROBABILITY,
      InfoFields.PREDICTED_REWARDS_MEAN,
+     InfoFields.PREDICTED_REWARDS_OPTIMISTIC,
      InfoFields.PREDICTED_REWARDS_SAMPLED,
      InfoFields.BANDIT_POLICY_TYPE))
 # Set default empty tuple for all fields.
@@ -51,8 +59,9 @@ PolicyInfo.__new__.__defaults__ = ((),) * len(PolicyInfo._fields)
 
 PerArmPolicyInfo = collections.namedtuple(  # pylint: disable=invalid-name
     'PerArmPolicyInfo',
-    (policy_step.CommonFields.LOG_PROBABILITY,
+    (InfoFields.LOG_PROBABILITY,
      InfoFields.PREDICTED_REWARDS_MEAN,
+     InfoFields.PREDICTED_REWARDS_OPTIMISTIC,
      InfoFields.PREDICTED_REWARDS_SAMPLED,
      InfoFields.BANDIT_POLICY_TYPE,
      InfoFields.CHOSEN_ARM_FEATURES))
@@ -82,9 +91,14 @@ def populate_policy_info(arm_observations, chosen_actions, rewards_for_argmax,
   """
   if accepts_per_arm_features:
     # Saving the features for the chosen action to the policy_info.
-    chosen_arm_features = tf.gather(
-        params=arm_observations, indices=chosen_actions, batch_dims=1)
+    chosen_arm_features = tf.nest.map_structure(
+        lambda t: tf.gather(params=t, indices=chosen_actions, batch_dims=1),
+        arm_observations)
     policy_info = PerArmPolicyInfo(
+        predicted_rewards_optimistic=(
+            rewards_for_argmax
+            if InfoFields.PREDICTED_REWARDS_OPTIMISTIC in emit_policy_info else
+            ()),
         predicted_rewards_sampled=(
             rewards_for_argmax if
             InfoFields.PREDICTED_REWARDS_SAMPLED in emit_policy_info else ()),
@@ -94,6 +108,10 @@ def populate_policy_info(arm_observations, chosen_actions, rewards_for_argmax,
         chosen_arm_features=chosen_arm_features)
   else:
     policy_info = PolicyInfo(
+        predicted_rewards_optimistic=(
+            rewards_for_argmax
+            if InfoFields.PREDICTED_REWARDS_OPTIMISTIC in emit_policy_info else
+            ()),
         predicted_rewards_sampled=(
             rewards_for_argmax if
             InfoFields.PREDICTED_REWARDS_SAMPLED in emit_policy_info else ()),
@@ -156,6 +174,18 @@ def has_bandit_policy_type(info, check_for_tensor=False):
   has_field = fields is not None and InfoFields.BANDIT_POLICY_TYPE in fields
   if has_field and check_for_tensor:
     return isinstance(info.bandit_policy_type, tf.Tensor)
+  else:
+    return has_field
+
+
+def has_chosen_arm_features(info, check_for_tensor=False):
+  """Check if policy info has `chosen_arm_features` field/tensor."""
+  if info in ((), None):
+    return False
+  fields = getattr(info, '_fields', None)
+  has_field = fields is not None and InfoFields.CHOSEN_ARM_FEATURES in fields
+  if has_field and check_for_tensor:
+    return isinstance(info.chosen_arm_features, tf.Tensor)
   else:
     return has_field
 
@@ -235,3 +265,64 @@ def compute_feasibility_probability(observation, constraints, batch_size,
     action_feasibility = c(observation)
     feasibility_prob *= action_feasibility
   return feasibility_prob
+
+
+def construct_mask_from_multiple_sources(
+    observation, observation_and_action_constraint_splitter, constraints,
+    max_num_actions):
+  """Constructs an action mask from multiple sources.
+
+  The sources include:
+  -- The action mask encoded in the observation,
+  -- the `num_actions` feature restricting the number of actions per sample,
+  -- the feasibility mask implied by constraints.
+
+  The resulting mask disables all actions that are masked out in any of the
+  three sources.
+
+  Args:
+    observation: A nest of Tensors containing the observation.
+    observation_and_action_constraint_splitter: The observation action mask
+      splitter function if the observation has action mask.
+    constraints: Iterable of constraints objects that are instances of
+        `tf_agents.bandits.agents.NeuralConstraint`.
+    max_num_actions: The maximum number of actions per sample.
+
+  Returns:
+    An action mask in the form of a `[batch_size, max_num_actions]` 0-1 tensor.
+  """
+  mask = None
+  if observation_and_action_constraint_splitter is not None:
+    observation, mask = observation_and_action_constraint_splitter(observation)
+  first_observation = tf.nest.flatten(observation)[0]
+  batch_size = tf.shape(first_observation)[0]
+  if (isinstance(observation, dict) and
+      bandit_spec_utils.NUM_ACTIONS_FEATURE_KEY in observation):
+    number_of_actions = observation[bandit_spec_utils.NUM_ACTIONS_FEATURE_KEY]
+    mask = tf.sequence_mask(
+        lengths=number_of_actions, maxlen=max_num_actions, dtype=tf.int32)
+
+  if constraints:
+    feasibility_prob = compute_feasibility_probability(
+        observation, constraints, batch_size,
+        max_num_actions, mask)
+    # Probabilistic masking.
+    mask = tfp.distributions.Bernoulli(probs=feasibility_prob).sample()
+  return mask
+
+
+def create_chosen_arm_features_info_spec(
+    observation_spec, observation_and_action_constraint_splitter=None):
+  """Creates the chosen arm features info spec from the arm observation spec."""
+  if observation_and_action_constraint_splitter is not None:
+    observation_spec = observation_and_action_constraint_splitter(
+        observation_spec)[0]
+    if bandit_spec_utils.NUM_ACTIONS_FEATURE_KEY in observation_spec:
+      raise ValueError('Variable number of actions and action masking '
+                       'should not be used together.')
+    logging.warning(
+        'Action masking with per-arm features is discouraged. '
+        'Instead, use variable number of actions via the `%s` feature key.',
+        bandit_spec_utils.NUM_ACTIONS_FEATURE_KEY)
+  arm_spec = observation_spec[bandit_spec_utils.PER_ARM_FEATURE_KEY]
+  return tensor_spec.remove_outer_dims_nest(arm_spec, 1)

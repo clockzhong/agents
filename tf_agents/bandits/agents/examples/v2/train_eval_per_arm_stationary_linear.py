@@ -29,6 +29,7 @@ import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
 from tf_agents.bandits.agents import lin_ucb_agent
 from tf_agents.bandits.agents import linear_thompson_sampling_agent as lin_ts_agent
 from tf_agents.bandits.agents import neural_epsilon_greedy_agent
+from tf_agents.bandits.agents import neural_linucb_agent
 from tf_agents.bandits.agents.examples.v2 import trainer
 from tf_agents.bandits.environments import stationary_stochastic_per_arm_py_environment as sspe
 from tf_agents.bandits.metrics import tf_metrics as tf_bandit_metrics
@@ -40,8 +41,9 @@ from tf_agents.environments import tf_py_environment
 flags.DEFINE_string('root_dir', os.getenv('TEST_UNDECLARED_OUTPUTS_DIR'),
                     'Root directory for writing logs/summaries/checkpoints.')
 flags.DEFINE_enum(
-    'agent', 'LinUCB', ['LinUCB', 'LinTS', 'epsGreedy'],
-    'Which agent to use. Possible values: `LinUCB`, `LinTS`, `epsGreedy`.'
+    'agent', 'LinUCB', ['LinUCB', 'LinTS', 'epsGreedy', 'NeuralLinUCB'],
+    'Which agent to use. Possible values: `LinUCB`, `LinTS`, `epsGreedy`, and '
+    '`NeuralLinUCB`.'
 )
 
 flags.DEFINE_enum(
@@ -52,10 +54,12 @@ flags.DEFINE_enum(
 flags.DEFINE_bool('drop_arm_obs', False, 'Whether to wipe the arm observations '
                   'from the trajectories.')
 
-flags.DEFINE_bool('add_trivial_mask', False, 'Whether to add action masking '
-                  'that still allows all actions, for testing purposes.')
+flags.DEFINE_bool('add_num_actions_feature', False,
+                  'Whether to add a `num_actions` feature key.')
 
 FLAGS = flags.FLAGS
+
+# Environment and driver parameters.
 
 BATCH_SIZE = 16
 NUM_ACTIONS = 7
@@ -63,10 +67,23 @@ HIDDEN_PARAM = [0, 1, 2, 3, 4, 5, 6, 7, 8]
 TRAINING_LOOPS = 2000
 STEPS_PER_LOOP = 2
 
+# Parameters for linear agents (LinUCB and LinTS).
+
 AGENT_ALPHA = 0.1
+
+# Parameters for neural agents (NeuralEpsGreedy and NerualLinUCB).
 
 EPSILON = 0.01
 LR = 0.05
+
+# Parameters for NeuralLinUCB. ENCODING_DIM is the output dimension of the
+# encoding network. This output will be used by either a linear reward layer and
+# epsilon greedy exploration, or by a LinUCB logic, depending on the number of
+# training steps executed so far. If the number of steps is less than or equal
+# to EPS_PHASE_STEPS, epsilon greedy is used, otherwise LinUCB.
+
+ENCODING_DIM = 9
+EPS_PHASE_STEPS = 1000
 
 
 def main(unused_argv):
@@ -91,9 +108,11 @@ def main(unused_argv):
 
   observation_and_action_constraint_splitter = None
   num_actions_fn = None
-  if FLAGS.add_trivial_mask:
+  variable_action_method = bandit_spec_utils.VariableActionMethod.FIXED
+  if FLAGS.add_num_actions_feature:
     num_actions_fn = lambda: NUM_ACTIONS
-    observation_and_action_constraint_splitter = lambda x: (x[0], x[1])
+    variable_action_method = (
+        bandit_spec_utils.VariableActionMethod.NUM_ACTIONS_FEATURE)
 
   env = sspe.StationaryStochasticPerArmPyEnvironment(
       _global_context_sampling_fn,
@@ -101,7 +120,8 @@ def main(unused_argv):
       NUM_ACTIONS,
       reward_fn,
       num_actions_fn,
-      batch_size=BATCH_SIZE)
+      batch_size=BATCH_SIZE,
+      variable_action_method=variable_action_method)
   environment = tf_py_environment.TFPyEnvironment(env)
 
   if FLAGS.agent == 'LinUCB':
@@ -109,8 +129,6 @@ def main(unused_argv):
         time_step_spec=environment.time_step_spec(),
         action_spec=environment.action_spec(),
         alpha=AGENT_ALPHA,
-        observation_and_action_constraint_splitter=(
-            observation_and_action_constraint_splitter),
         accepts_per_arm_features=True,
         dtype=tf.float32)
   elif FLAGS.agent == 'LinTS':
@@ -124,13 +142,11 @@ def main(unused_argv):
         dtype=tf.float32)
   elif FLAGS.agent == 'epsGreedy':
     obs_spec = environment.observation_spec()
-    if FLAGS.add_trivial_mask:
-      obs_spec = obs_spec[0]
     if FLAGS.network == 'commontower':
       network = (
           global_and_arm_feature_network
-          .create_feed_forward_common_tower_network(obs_spec, (4, 3), (3, 4),
-                                                    (4, 2)))
+          .create_feed_forward_common_tower_network(obs_spec, (40, 30),
+                                                    (30, 40), (40, 20)))
     elif FLAGS.network == 'dotproduct':
       network = (
           global_and_arm_feature_network
@@ -146,11 +162,28 @@ def main(unused_argv):
             observation_and_action_constraint_splitter),
         accepts_per_arm_features=True,
         emit_policy_info=policy_utilities.InfoFields.PREDICTED_REWARDS_MEAN)
+  elif FLAGS.agent == 'NeuralLinUCB':
+    obs_spec = environment.observation_spec()
+    network = (
+        global_and_arm_feature_network.create_feed_forward_common_tower_network(
+            obs_spec, (40, 30), (30, 40), (40, 20), ENCODING_DIM))
+    agent = neural_linucb_agent.NeuralLinUCBAgent(
+        time_step_spec=environment.time_step_spec(),
+        action_spec=environment.action_spec(),
+        encoding_network=network,
+        encoding_network_num_train_steps=EPS_PHASE_STEPS,
+        encoding_dim=ENCODING_DIM,
+        optimizer=tf.compat.v1.train.AdamOptimizer(learning_rate=LR),
+        alpha=1.0,
+        gamma=1.0,
+        epsilon_greedy=EPSILON,
+        accepts_per_arm_features=True,
+        debug_summaries=True,
+        summarize_grads_and_vars=True,
+        emit_policy_info=policy_utilities.InfoFields.PREDICTED_REWARDS_MEAN)
 
   def _all_rewards(observation, hidden_param):
     """Outputs rewards for all actions, given an observation."""
-    if observation_and_action_constraint_splitter is not None:
-      observation = observation_and_action_constraint_splitter(observation)[0]
     hidden_param = tf.cast(hidden_param, dtype=tf.float32)
     global_obs = observation[bandit_spec_utils.GLOBAL_FEATURE_KEY]
     per_arm_obs = observation[bandit_spec_utils.PER_ARM_FEATURE_KEY]
@@ -178,9 +211,7 @@ def main(unused_argv):
 
   if FLAGS.drop_arm_obs:
     drop_arm_feature_fn = functools.partial(
-        bandit_spec_utils.drop_arm_observation,
-        observation_and_action_constraint_splitter=(
-            observation_and_action_constraint_splitter))
+        bandit_spec_utils.drop_arm_observation)
   else:
     drop_arm_feature_fn = None
   trainer.train(

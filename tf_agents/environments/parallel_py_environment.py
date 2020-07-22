@@ -17,11 +17,13 @@
 
 from __future__ import absolute_import
 from __future__ import division
+# Using Type Annotations.
 from __future__ import print_function
 
 import atexit
 import sys
 import traceback
+from typing import Any, Callable, Sequence, Text, Union
 
 from absl import logging
 
@@ -32,11 +34,16 @@ import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
 
 from tf_agents.environments import py_environment
 from tf_agents.system import system_multiprocessing as multiprocessing
+from tf_agents.trajectories import time_step as ts
+from tf_agents.typing import types
 from tf_agents.utils import nest_utils
 
 
 # Worker polling period in seconds.
 _POLLING_PERIOD = 0.1
+
+EnvConstructor = Callable[[], py_environment.PyEnvironment]
+Promise = Callable[[], Any]
 
 
 @gin.configurable
@@ -49,8 +56,11 @@ class ParallelPyEnvironment(py_environment.PyEnvironment):
   access global variables.
   """
 
-  def __init__(self, env_constructors, start_serially=True, blocking=False,
-               flatten=False):
+  def __init__(self,
+               env_constructors: Sequence[EnvConstructor],
+               start_serially: bool = True,
+               blocking: bool = False,
+               flatten: bool = False):
     """Batch together environments and simulate them in external processes.
 
     The environments can be different but must use the same action and
@@ -67,6 +77,11 @@ class ParallelPyEnvironment(py_environment.PyEnvironment):
       ValueError: If the action or observation specs don't match.
     """
     super(ParallelPyEnvironment, self).__init__()
+    if any([not callable(ctor) for ctor in env_constructors]):
+      raise TypeError(
+          'Found non-callable `env_constructors` in `ParallelPyEnvironment` '
+          '__init__ call. Did you accidentally pass in environment instances '
+          'instead of constructors? Got: {}'.format(env_constructors))
     self._envs = [ProcessPyEnvironment(ctor, flatten=flatten)
                   for ctor in env_constructors]
     self._num_envs = len(env_constructors)
@@ -83,7 +98,7 @@ class ParallelPyEnvironment(py_environment.PyEnvironment):
       raise ValueError('All environments must have the same time_step_spec.')
     self._flatten = flatten
 
-  def start(self):
+  def start(self) -> None:
     logging.info('Spawning all processes.')
     for env in self._envs:
       env.start(wait_to_start=self._start_serially)
@@ -94,20 +109,24 @@ class ParallelPyEnvironment(py_environment.PyEnvironment):
     logging.info('All processes started.')
 
   @property
-  def batched(self):
+  def batched(self) -> bool:
     return True
 
   @property
-  def batch_size(self):
+  def batch_size(self) -> int:
     return self._num_envs
 
-  def observation_spec(self):
+  @property
+  def envs(self):
+    return self._envs
+
+  def observation_spec(self) -> types.NestedArraySpec:
     return self._observation_spec
 
-  def action_spec(self):
+  def action_spec(self) -> types.NestedArraySpec:
     return self._action_spec
 
-  def time_step_spec(self):
+  def time_step_spec(self)  -> ts.TimeStep:
     return self._time_step_spec
 
   def _reset(self):
@@ -141,7 +160,7 @@ class ParallelPyEnvironment(py_environment.PyEnvironment):
       time_steps = [promise() for promise in time_steps]
     return self._stack_time_steps(time_steps)
 
-  def close(self):
+  def close(self) -> None:
     """Close all external process."""
     logging.info('Closing all processes.')
     for env in self._envs:
@@ -169,7 +188,7 @@ class ParallelPyEnvironment(py_environment.PyEnvironment):
       ]
     return unstacked_actions
 
-  def seed(self, seeds):
+  def seed(self, seeds: Sequence[types.Seed]) -> Sequence[Any]:
     """Seeds the parallel environments."""
     if len(seeds) != len(self._envs):
       raise ValueError(
@@ -178,6 +197,28 @@ class ParallelPyEnvironment(py_environment.PyEnvironment):
     promises = [env.call('seed', seed) for seed, env in zip(seeds, self._envs)]
     # Block until all envs are seeded.
     return [promise() for promise in promises]
+
+  def render(self, mode: Text = 'rgb_array') -> types.NestedArray:
+    """Renders the environment.
+
+    Args:
+      mode: Rendering mode. Currently only 'rgb_array' is supported because
+        this is a batched environment.
+
+    Returns:
+      An ndarray of shape [batch_size, width, height, 3] denoting RGB images
+      (for mode=`rgb_array`).
+    Raises:
+      NotImplementedError: If the environment does not support rendering,
+        or any other mode than `rgb_array` is given.
+    """
+    if mode != 'rgb_array':
+      raise NotImplementedError('Only rgb_array rendering mode is supported. '
+                                'Got %s' % mode)
+    imgs = [env.render(mode, blocking=self._blocking) for env in self._envs]
+    if not self._blocking:
+      imgs = [promise() for promise in imgs]
+    return nest_utils.stack_nested_arrays(imgs)
 
 
 class ProcessPyEnvironment(object):
@@ -191,7 +232,7 @@ class ProcessPyEnvironment(object):
   _EXCEPTION = 5
   _CLOSE = 6
 
-  def __init__(self, env_constructor, flatten=False):
+  def __init__(self, env_constructor: EnvConstructor, flatten: bool = False):
     """Step environment in a separate process for lock free paralellism.
 
     The environment is created in an external process by calling the provided
@@ -220,7 +261,7 @@ class ProcessPyEnvironment(object):
     self._action_spec = None
     self._time_step_spec = None
 
-  def start(self, wait_to_start=True):
+  def start(self, wait_to_start: bool = True) -> None:
     """Start the process.
 
     Args:
@@ -234,7 +275,7 @@ class ProcessPyEnvironment(object):
     if wait_to_start:
       self.wait_start()
 
-  def wait_start(self):
+  def wait_start(self) -> None:
     """Wait for the started process to finish initialization."""
     result = self._conn.recv()
     if isinstance(result, Exception):
@@ -243,22 +284,22 @@ class ProcessPyEnvironment(object):
       raise result
     assert result == self._READY, result
 
-  def observation_spec(self):
+  def observation_spec(self) -> types.NestedArraySpec:
     if not self._observation_spec:
       self._observation_spec = self.call('observation_spec')()
     return self._observation_spec
 
-  def action_spec(self):
+  def action_spec(self) -> types.NestedArraySpec:
     if not self._action_spec:
       self._action_spec = self.call('action_spec')()
     return self._action_spec
 
-  def time_step_spec(self):
+  def time_step_spec(self) -> ts.TimeStep:
     if not self._time_step_spec:
       self._time_step_spec = self.call('time_step_spec')()
     return self._time_step_spec
 
-  def __getattr__(self, name):
+  def __getattr__(self, name: Text) -> Any:
     """Request an attribute from the environment.
 
     Note that this involves communication with the external process, so it can
@@ -286,7 +327,7 @@ class ProcessPyEnvironment(object):
     self._conn.send((self._ACCESS, name))
     return self._receive()
 
-  def call(self, name, *args, **kwargs):
+  def call(self, name: Text, *args, **kwargs) -> Promise:
     """Asynchronously call a method of the external environment.
 
     Args:
@@ -301,7 +342,7 @@ class ProcessPyEnvironment(object):
     self._conn.send((self._CALL, payload))
     return self._receive
 
-  def access(self, name):
+  def access(self, name: Text) -> Any:
     """Access an attribute of the external environment.
 
     This method blocks.
@@ -315,7 +356,7 @@ class ProcessPyEnvironment(object):
     self._conn.send((self._ACCESS, name))
     return self._receive()
 
-  def close(self):
+  def close(self) -> None:
     """Send a close message to the external process and join it."""
     try:
       self._conn.send((self._CLOSE, None))
@@ -326,7 +367,9 @@ class ProcessPyEnvironment(object):
     if self._process.is_alive():
       self._process.join(5)
 
-  def step(self, action, blocking=True):
+  def step(self,
+           action: types.NestedArray,
+           blocking: bool = True) -> Union[ts.TimeStep, Promise]:
     """Step the environment.
 
     Args:
@@ -342,7 +385,7 @@ class ProcessPyEnvironment(object):
     else:
       return promise
 
-  def reset(self, blocking=True):
+  def reset(self, blocking: bool = True) -> Union[ts.TimeStep, Promise]:
     """Reset the environment.
 
     Args:
@@ -353,6 +396,31 @@ class ProcessPyEnvironment(object):
       observation.
     """
     promise = self.call('reset')
+    if blocking:
+      return promise()
+    else:
+      return promise
+
+  def render(self,
+             mode: Text = 'rgb_array',
+             blocking: bool = True) -> Union[types.NestedArray, Promise]:
+    """Renders the environment.
+
+    Args:
+      mode: Rendering mode. Only 'rgb_array' is supported.
+      blocking: Whether to wait for the result.
+
+    Returns:
+      An ndarray of shape [width, height, 3] denoting an RGB image when
+      blocking. Otherwise, callable that returns the rendered image.
+    Raises:
+      NotImplementedError: If the environment does not support rendering,
+        or any other modes than `rgb_array` is given.
+    """
+    if mode != 'rgb_array':
+      raise NotImplementedError('Only rgb_array rendering mode is supported. '
+                                'Got %s' % mode)
+    promise = self.call('render')
     if blocking:
       return promise()
     else:

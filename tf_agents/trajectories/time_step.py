@@ -20,7 +20,6 @@ from __future__ import division
 # Using Type Annotations.
 from __future__ import print_function
 
-import functools
 import numpy as np
 
 import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
@@ -30,7 +29,14 @@ from tf_agents.specs import tensor_spec
 from tf_agents.typing import types
 from typing import NamedTuple, Optional
 
-_as_float32_array = functools.partial(np.asarray, dtype=np.float32)
+
+def _as_float32_array(a):
+  r = np.asarray(a, dtype=np.float32)
+  if np.isnan(np.sum(r)):
+    raise ValueError('Received a time_step input that converted to a nan array.'
+                     ' Did you accidentally set some input value to None?.\n'
+                     'Got:\n{}'.format(a))
+  return r
 
 
 class TimeStep(
@@ -151,7 +157,8 @@ def restart(observation: types.NestedTensorOrArray,
   else:
     reward = tf.nest.map_structure(
         # pylint: disable=g-long-lambda
-        lambda r: tf.fill(shape + r.shape, _as_float32_array(0.0),
+        lambda r: tf.fill(tf.concat([shape, r.shape], axis=-1),
+                          _as_float32_array(0.0),
                           name='reward'), reward_spec)
   discount = tf.fill(shape, _as_float32_array(1.0), name='discount')
   return TimeStep(step_type, reward, discount, observation)

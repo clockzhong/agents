@@ -17,16 +17,22 @@
 
 from __future__ import absolute_import
 from __future__ import division
+# Using Type Annotations.
 from __future__ import print_function
 
 import abc
+import typing
+
 import six
 
-import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
-
+import tensorflow.compat.v2 as tf
 from tensorflow.keras import layers  # pylint: disable=unused-import
+import tensorflow_probability as tfp
+
+from tf_agents.keras_layers import sequential_layer
 from tf_agents.specs import tensor_spec
 from tf_agents.trajectories import time_step
+from tf_agents.typing import types
 from tf_agents.utils import common
 from tf_agents.utils import nest_utils
 from tf_agents.utils import object_identity
@@ -143,20 +149,25 @@ class Network(tf.keras.layers.Layer):
     """Creates an instance of `Network`.
 
     Args:
-      input_tensor_spec: A nest of `tensor_spec.TensorSpec` representing the
+      input_tensor_spec: A nest of `tf.TypeSpec` representing the
         input observations.  Optional.  If not provided, `create_variables()`
         will fail unless a spec is provided.
       state_spec: A nest of `tensor_spec.TensorSpec` representing the state
         needed by the network. Default is `()`, which means no state.
       name: (Optional.) A string representing the name of the network.
     """
-    super(Network, self).__init__(name=name)
+    # Disable autocast because it may convert bfloats to other types, breaking
+    # our spec checks.
+    super(Network, self).__init__(name=name, autocast=False)
     common.check_tf1_allowed()
 
     # Required for summary() to work.
     self._is_graph_network = False
 
     self._input_tensor_spec = input_tensor_spec
+    # NOTE(ebrevdo): Would have preferred to call this output_tensor_spec, but
+    # looks like keras.Layer already reserves that one.
+    self._network_output_spec = None
     self._state_spec = state_spec
 
   @property
@@ -171,17 +182,24 @@ class Network(tf.keras.layers.Layer):
   def create_variables(self, input_tensor_spec=None, **kwargs):
     """Force creation of the network's variables.
 
+    Return output specs.
+
     Args:
       input_tensor_spec: (Optional).  Override or provide an input tensor spec
         when creating variables.
       **kwargs: Other arguments to `network.call()`, e.g. `training=True`.
 
+    Returns:
+      Output specs - a nested spec calculated from the outputs (excluding any
+      batch dimensions).  If any of the output elements is a tfp `Distribution`,
+      the associated spec entry returned is `None`.
+
     Raises:
       ValueError: If no `input_tensor_spec` is provided, and the network did
         not provide one during construction.
     """
-    if self.built:
-      return
+    if self._network_output_spec is not None:
+      return self._network_output_spec
     if self._input_tensor_spec is None:
       self._input_tensor_spec = input_tensor_spec
     input_tensor_spec = self._input_tensor_spec
@@ -194,10 +212,22 @@ class Network(tf.keras.layers.Layer):
         input_tensor_spec, outer_dims=(1,))
     initial_state = self.get_initial_state(batch_size=1)
     step_type = tf.fill((1,), time_step.StepType.FIRST)
-    # TODO(b/156314637): Convert outputs to output_spec and return those.
-    self.__call__(
-        random_input, step_type=step_type, network_state=initial_state,
+    outputs = self.__call__(
+        random_input,
+        step_type=step_type,
+        network_state=initial_state,
         **kwargs)
+
+    def _calc_unbatched_spec(x):
+      if isinstance(x, tfp.distributions.Distribution):
+        return None
+      else:
+        return nest_utils.remove_singleton_batch_spec_dim(
+            tf.type_spec_from_value(x), outer_ndim=1)
+
+    self._network_output_spec = tf.nest.map_structure(
+        _calc_unbatched_spec, outputs[0])
+    return self._network_output_spec
 
   @property
   def variables(self):
@@ -338,10 +368,14 @@ class Network(tf.keras.layers.Layer):
       A tuple `(outputs, new_network_state)`.
     """
     if self.input_tensor_spec is not None:
-      nest_utils.assert_same_structure(
+      nest_utils.assert_matching_dtypes_and_inner_shapes(
           inputs,
           self.input_tensor_spec,
-          message="inputs and input_tensor_spec structures do not match")
+          allow_extra_fields=True,
+          caller=self,
+          tensors_name="`inputs`",
+          specs_name="`input_tensor_spec`")
+
     call_argspec = tf_inspect.getargspec(self.call)
 
     # Convert *args, **kwargs to a canonical kwarg representation.
@@ -351,11 +385,22 @@ class Network(tf.keras.layers.Layer):
     network_state = normalized_kwargs.get("network_state", None)
     normalized_kwargs.pop("self", None)
 
-    if network_state not in (None, ()):
-      nest_utils.assert_same_structure(
+    # TODO(b/158804957): tf.function changes "s in ((),)" to a tensor bool expr.
+    # pylint: disable=literal-comparison
+    network_has_state = (
+        network_state is not None
+        and network_state is not ()
+        and network_state is not [])
+    # pylint: enable=literal-comparison
+
+    if network_has_state:
+      nest_utils.assert_matching_dtypes_and_inner_shapes(
           network_state,
           self.state_spec,
-          message="network_state and state_spec structures do not match")
+          allow_extra_fields=True,
+          caller=self,
+          tensors_name="`network_state`",
+          specs_name="`state_spec`")
 
     if "step_type" not in call_argspec.args and not call_argspec.keywords:
       normalized_kwargs.pop("step_type", None)
@@ -366,10 +411,14 @@ class Network(tf.keras.layers.Layer):
       normalized_kwargs.pop("network_state", None)
 
     outputs, new_state = super(Network, self).__call__(**normalized_kwargs)
-    nest_utils.assert_same_structure(
+
+    nest_utils.assert_matching_dtypes_and_inner_shapes(
         new_state,
         self.state_spec,
-        message="network output state and state_spec structures do not match")
+        allow_extra_fields=True,
+        caller=self,
+        tensors_name="`new_state`",
+        specs_name="`state_spec`")
 
     return outputs, new_state
 
@@ -449,3 +498,164 @@ def _filter_empty_layer_containers(layer_list):
       # Trackable data structures will not show up in ".layers" lists, but
       # the layers they contain will.
       to_visit.extend(sub_layers[::-1])
+
+
+def create_variables(module: typing.Union[Network, tf.keras.layers.Layer],
+                     input_spec: typing.Optional[types.NestedTensorSpec] = None,
+                     **kwargs: typing.Any) -> types.NestedTensorSpec:
+  """Create variables in `module` given `input_spec`; return `output_spec`.
+
+  Here `module` can be a `Network`, and we will soon also support Keras
+  layers (and possibly Sonnet layers).
+
+  Args:
+    module: The instance we would like to create layers on.
+    input_spec: The input spec (excluding batch dimensions).
+    **kwargs: Extra arguments to `module.__call__`, e.g. `training=True`.
+
+  Returns:
+    Output specs, a nested `tf.TypeSpec` describing the output signature.
+
+  Raises:
+    ValueError: If `module` is a generic Keras layer but `input_spec is None`.
+    TypeError: If `module` is a `tf.keras.layers.{RNN,LSTM,GRU,...}`.  These
+      must be wrapped in `tf_agents.keras_layers.RNNWrapper`.
+  """
+  # NOTE(ebrevdo): As a side effect, for generic keras Layers (not Networks)
+  # this method stores new hidden properties in `module`:
+  # `_network_output_spec`, `_network_state_spec`,
+  # - which internal TF-Agents libraries make use of.
+  if isinstance(module, Network):
+    return module.create_variables(input_spec, **kwargs)
+
+  # Generic keras layer
+  if input_spec is None:
+    raise ValueError(
+        "Module is a Keras layer; an input_spec is required but saw "
+        "None: {}".format(module))
+
+  if isinstance(module, tf.keras.layers.RNN):
+    raise TypeError(
+        "Keras RNN layers (non-cell layers) must be wrapped in "
+        "tf_agents.keras_layers.RNNWrapper.  Layer: {}".format(module))
+
+  maybe_spec = getattr(module, "_network_output_spec", None)
+  if maybe_spec is not None:
+    return maybe_spec
+
+  # Has state outputs.
+  recurrent_layer = getattr(module, "get_initial_state", None) is not None
+
+  # Required input rank
+  outer_ndim = _get_input_outer_ndim(module, input_spec)
+
+  random_input = tensor_spec.sample_spec_nest(
+      input_spec, outer_dims=(1,) * outer_ndim)
+
+  if recurrent_layer:
+    state = module.get_initial_state(random_input)
+
+    def remove_singleton_batch_spec_dim(t):
+      # Convert tensor to its type-spec, and remove the batch dimension
+      # from the spec.
+      spec = tf.type_spec_from_value(t)
+      return nest_utils.remove_singleton_batch_spec_dim(spec, outer_ndim=1)
+    state_spec = tf.nest.map_structure(remove_singleton_batch_spec_dim, state)
+
+    outputs = module(random_input, state, **kwargs)
+    # tf.keras.layers.{LSTMCell, ...} return (output, [state1, state2,...]).
+    output = outputs[0]
+  else:
+    output = module(random_input, **kwargs)
+    state_spec = ()
+
+  def _calc_unbatched_spec(x):
+    if isinstance(x, tfp.distributions.Distribution):
+      return None
+    else:
+      return nest_utils.remove_singleton_batch_spec_dim(
+          tf.type_spec_from_value(x), outer_ndim=outer_ndim)
+
+  # pylint: disable=protected-access
+  module._network_output_spec = tf.nest.map_structure(_calc_unbatched_spec,
+                                                      output)
+  module._network_state_spec = state_spec
+
+  return module._network_output_spec
+  # pylint: enable=protected-access
+
+
+def _get_input_outer_ndim(layer: tf.keras.layers.Layer,
+                          input_spec: types.NestedTensorSpec) -> int:
+  """Calculate or guess the number of batch (outer) ndims in `layer`."""
+  if isinstance(layer, tf.keras.layers.RNN):
+    raise TypeError(
+        "Saw a tf.keras.layers.RNN layer nested inside e.g. a keras Sequential "
+        "layer.  This is not directly supported.  Please wrap your layer "
+        "inside a `tf_agents.keras_layers.RNNWrapper` or use "
+        "`tf_agents.networks.Sequential`.  Layer: {}".format(layer))
+  if isinstance(layer, tf.keras.layers.TimeDistributed):
+    return 1 + _get_input_outer_ndim(layer.layer, input_spec)
+  if isinstance(layer, (sequential_layer.SequentialLayer, tf.keras.Sequential)):
+    # We don't trust Sequential to give us the right thing if the first layer
+    # is e.g. a TimeDistributed.
+    return _get_input_outer_ndim(layer.layers[0], input_spec)
+
+  layer_input_spec = layer.input_spec
+
+  if layer_input_spec is None:
+    return 1
+
+  outer_ndim = layer_input_spec.ndim
+  if outer_ndim is None:
+    outer_ndim = layer_input_spec.min_ndim
+
+  if outer_ndim is None:
+    return 1
+
+  if input_spec:
+    input_spec = tf.nest.flatten(input_spec)[0]
+    if outer_ndim >= input_spec.shape.ndims:
+      # We can capture the "outer batch size" as the diff between the
+      # expected input rank and the rank of the non-batched spec passed in the
+      # input_spec.
+      return outer_ndim - input_spec.shape.ndims
+
+  # Empty input_spec.
+  return 1
+
+
+def get_state_spec(layer: tf.keras.layers.Layer) -> types.NestedTensorSpec:
+  """Extracts the state spec from a layer.
+
+  Args:
+    layer: The layer to extract from; can be a `Network`.
+
+  Returns:
+    The state spec.
+
+  Raises:
+    TypeError: If `layer` is a subclass of `tf.keras.layers.RNN` (it must
+      be wrapped by an `RNNWrapper` object).
+    ValueError: If `layer` is a Keras layer and `create_variables` has
+      not been called on it.
+  """
+  if isinstance(layer, Network):
+    return layer.state_spec
+
+  if isinstance(layer, tf.keras.layers.RNN):
+    raise TypeError("RNN Layer must be wrapped inside "
+                    "`tf_agents.keras_layers.RNNWrapper`: {}".format(layer))
+
+  initial_state = getattr(layer, "get_initial_state", None)
+  state_size = getattr(layer, "state_size", None)
+  if initial_state is not None and state_size is None:
+    raise ValueError(
+        "Layer lacks a `state_size` property.  Unable to extract state "
+        "spec: {}".format(layer))
+  state_spec = ()
+  if state_size is not None:
+    state_spec = tf.nest.map_structure(
+        lambda s: tf.TensorSpec(dtype=layer.dtype, shape=s), state_size)
+
+  return state_spec

@@ -275,7 +275,8 @@ class TFTimeStepTest(tf.test.TestCase):
     observation = tf.constant(-1)
     reward_spec = [tensor_spec.TensorSpec((1,), tf.float32, 'r1'),
                    tensor_spec.TensorSpec((2,), tf.float32, 'r2')]
-    time_step = ts.restart(observation, batch_size=2, reward_spec=reward_spec)
+    time_step = ts.restart(observation, batch_size=tf.constant(2, shape=[1]),
+                           reward_spec=reward_spec)
     time_step_ = self.evaluate(time_step)
 
     expected_reward = [np.array([[0.], [0.]], dtype=np.float32),
@@ -398,6 +399,12 @@ class TFTimeStepTest(tf.test.TestCase):
     self.assertAllEqual(reward[0], time_step_with_outerdims_.reward[0])
     self.assertAllEqual(reward[1], time_step_with_outerdims_.reward[1])
     self.assertItemsEqual([0.5, 0.5], time_step_.discount)
+
+  def testNoneValuesCaught(self):
+    observation = (1, 2)
+    reward = (None, None)
+    with self.assertRaises(ValueError):
+      ts.transition(observation, reward)
 
 
 class TFTimeStepSpecTest(tf.test.TestCase):

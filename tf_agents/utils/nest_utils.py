@@ -17,11 +17,13 @@
 
 from __future__ import absolute_import
 from __future__ import division
+# Using Type Annotations.
 from __future__ import print_function
 
 import collections
 import numbers
 
+from absl import logging
 import numpy as np
 from six.moves import zip
 import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
@@ -40,7 +42,9 @@ except AttributeError:
   collections_abc = collections
 
 
+flatten_up_to = nest.flatten_up_to
 flatten_with_tuple_paths = nest.flatten_with_tuple_paths
+map_structure_up_to = nest.map_structure_up_to
 map_structure_with_paths = nest.map_structure_with_paths
 
 
@@ -93,7 +97,7 @@ def assert_same_structure(nest1,
   message = message or 'The two structures do not match'
   exception = None
   try:
-    return tf.nest.assert_same_structure(
+    tf.nest.assert_same_structure(
         nest1,
         nest2,
         check_types=check_types,
@@ -260,46 +264,76 @@ def prune_extra_keys(narrow, wide):
   return wide
 
 
-def matching_dtypes_and_inner_shapes(tensors, specs, allow_extra_fields=False):
+def assert_matching_dtypes_and_inner_shapes(tensors,
+                                            specs,
+                                            caller,
+                                            tensors_name,
+                                            specs_name,
+                                            allow_extra_fields=False):
   """Returns `True` if tensors and specs have matching dtypes and inner shapes.
 
   Args:
     tensors: A nest of tensor objects.
     specs: A nest of `tf.TypeSpec` objects.
-    allow_extra_fields: If `True`, then `tensors` may contain more keys
-      or list fields than strictly required by `specs`.
+    caller: The object calling `assert...`.
+    tensors_name: (str) Name to use for the tensors in case of an error.
+    specs_name: (str) Name to use for the specs in case of an error.
+    allow_extra_fields: If `True`, then `tensors` may contain more keys or list
+      fields than strictly required by `specs`.
 
-  Returns:
-    A python `bool`.
+  Raises:
+    ValueError: If the tensors do not match the specs' dtypes or their inner
+      shapes do not match the specs' shapes.
   """
   if allow_extra_fields:
     tensors = prune_extra_keys(specs, tensors)
   assert_same_structure(
       tensors,
       specs,
-      message='Tensors and specs do not have matching structures')
+      message=('{}: {} and {} do not have matching structures'.format(
+          caller, tensors_name, specs_name)))
 
   flat_tensors = nest.flatten(tensors)
   flat_specs = tf.nest.flatten(specs)
+  flat_tensors = [
+      tf.convert_to_tensor(t, dtype_hint=s.dtype) if not tf.is_tensor(t) else t
+      for (t, s) in zip(flat_tensors, flat_specs)
+  ]
 
   tensor_shapes = [t.shape for t in flat_tensors]
   tensor_dtypes = [t.dtype for t in flat_tensors]
   spec_shapes = [spec_shape(s) for s in flat_specs]
   spec_dtypes = [t.dtype for t in flat_specs]
 
+  compatible = True
+
   if any(s_dtype != t_dtype
          for s_dtype, t_dtype in zip(spec_dtypes, tensor_dtypes)):
-    return False
+    compatible = False
+  else:
+    for s_shape, t_shape in zip(spec_shapes, tensor_shapes):
+      if s_shape.ndims in (0, None) or t_shape.ndims is None:
+        continue
+      if s_shape.ndims > t_shape.ndims:
+        compatible = False
+        break
+      if not s_shape.is_compatible_with(t_shape[-s_shape.ndims:]):
+        compatible = False
+        break
 
-  for s_shape, t_shape in zip(spec_shapes, tensor_shapes):
-    if s_shape.ndims is None or t_shape.ndims is None:
-      continue
-    if s_shape.ndims > t_shape.ndims:
-      return False
-    if not s_shape.is_compatible_with(t_shape[-s_shape.ndims:]):
-      return False
-
-  return True
+  if not compatible:
+    get_dtypes = lambda v: tf.nest.map_structure(lambda x: x.dtype, v)
+    get_shapes = lambda v: tf.nest.map_structure(spec_shape, v)
+    raise ValueError('{}: Inconsistent dtypes or shapes between {} and {}.\n'
+                     'dtypes:\n{}\nvs.\n{}.\n'
+                     'shapes:\n{}\nvs.\n{}.'.format(
+                         caller,
+                         tensors_name,
+                         specs_name,
+                         get_dtypes(tensors),
+                         get_dtypes(specs),
+                         get_shapes(tensors),
+                         get_shapes(specs)))
 
 
 def is_batched_nested_tensors(
@@ -899,3 +933,94 @@ def where(condition, true_outputs, false_outputs):
   return tf.nest.map_structure(
       lambda t, f: tf.compat.v2.where(condition, t, f), true_outputs,
       false_outputs)
+
+
+def remove_singleton_batch_spec_dim(spec: tf.TypeSpec,
+                                    outer_ndim: int) -> tf.TypeSpec:
+  """Look for `spec`'s shape, check that outer dim is 1, and remove it.
+
+  If `spec.shape[i] != 1` for any `i in range(outer_ndim)`, we stop removing
+  singleton batch dimensions at `i` and return what's left.  This is necessary
+  to handle the outputs of inconsistent layers like `tf.keras.layers.LSTM()`
+  which may take as input `(batch, time, dim) = (1, 1, Nin)` and emits only the
+  batch entry if `time == 1`: output shape is `(1, Nout)`.  We log an error
+  in these cases.
+
+  Args:
+    spec: A `tf.TypeSpec`.
+    outer_ndim: The maximum number of outer singleton dims to remove.
+
+  Returns:
+    A `tf.TypeSpec`, the spec without its outer batch dimension(s).
+
+  Raises:
+    ValueError: If `spec` lacks a `shape` property.
+  """
+  shape = getattr(spec, 'shape', None)
+  if shape is None:
+    shape = getattr(spec, '_shape', None)
+  if shape is None:
+    raise ValueError(
+        'Could not remove singleton batch dim from spec; it lacks a shape: {}'
+        .format(spec))
+  for i in range(outer_ndim):
+    if len(shape) <= i:
+      logging.error(
+          'Could not remove singleton batch dim from spec; len(shape) < %d.  '
+          'Shape: %s.  Skipping.', i + 1, shape)
+      break
+    if tf.compat.dimension_value(shape[i]) != 1:
+      logging.error(
+          'Could not remove singleton batch dim from spec; shape[%d] != 1: %s '
+          '(shape: %s).  Skipping.', i, spec, shape)
+      break
+    spec = spec._unbatch()  # pylint: disable=protected-access
+  return spec
+
+
+def _tile_batch(t, multiplier):
+  """Core single-tensor implementation of tile_batch."""
+  t = tf.convert_to_tensor(t, name='t')
+  shape_t = tf.shape(t)
+  if t.shape.ndims is None or t.shape.ndims < 1:
+    raise ValueError('t must have statically known rank')
+  tiling = [1] * (t.shape.ndims + 1)
+  tiling[1] = multiplier
+  tiled_static_batch_size = (
+      t.shape.dims[0].value * multiplier
+      if t.shape.dims[0].value is not None else None)
+  tiled = tf.tile(tf.expand_dims(t, 1), tiling)
+  tiled = tf.reshape(tiled,
+                     tf.concat(
+                         ([shape_t[0] * multiplier], shape_t[1:]), 0))
+  tiled.set_shape(
+      tf.TensorShape([tiled_static_batch_size]).concatenate(
+          t.shape[1:]))
+  return tiled
+
+
+def tile_batch(tensors, multiplier):
+  """Tile the batch dimension of a (possibly nested structure of) tensor(s).
+
+  Copied from tensorflow/contrib/seq2seq/python/ops/beam_search_decoder.py
+
+  For each tensor t in a (possibly nested structure) of tensors,
+  this function takes a tensor t shaped `[batch_size, s0, s1, ...]` composed of
+  minibatch entries `t[0], ..., t[batch_size - 1]` and tiles it to have a shape
+  `[batch_size * multiplier, s0, s1, ...]` composed of minibatch entries
+  `t[0], t[0], ..., t[1], t[1], ...` where each minibatch entry is repeated
+  `multiplier` times.
+
+  Args:
+    tensors: A nested structure of `Tensor` shaped `[batch_size, ...]`.
+    multiplier: Python int.
+
+  Returns:
+    A (possibly nested structure of) `Tensor` shaped
+    `[batch_size * multiplier, ...]`.
+
+  Raises:
+    ValueError: if tensor(s) `t` do not have a statically known rank or
+    the rank is < 1.
+  """
+  return tf.nest.map_structure(lambda t_: _tile_batch(t_, multiplier), tensors)

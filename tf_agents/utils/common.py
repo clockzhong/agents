@@ -21,12 +21,12 @@ from __future__ import print_function
 
 import collections as cs
 import contextlib
+import distutils.version
 import functools
 import importlib
 import os
 
 from absl import logging
-import distutils.version
 
 import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
 
@@ -212,7 +212,7 @@ def create_variable(name,
         initial_value = tf.convert_to_tensor(initial_value, dtype=dtype)
     else:
       if callable(initializer):
-        initial_value = lambda: initializer(shape)
+        initial_value = lambda: initializer(shape, dtype)
       else:
         initial_value = initializer
     return tf.compat.v2.Variable(
@@ -1211,11 +1211,10 @@ def check_no_shared_variables(network_1, network_2):
     ValueError: if one of the networks has not yet been built
       (e.g. user must call `create_variables`).
   """
-  variables_1 = {id(v): v for v in network_1.trainable_variables}
-  variables_2 = {id(v): v for v in network_2.trainable_variables}
-  shared = set(variables_1.keys()) & set(variables_2.keys())
-  if shared:
-    shared_variables = [variables_1[v] for v in shared]
+  variables_1 = object_identity.ObjectIdentitySet(network_1.trainable_variables)
+  variables_2 = object_identity.ObjectIdentitySet(network_2.trainable_variables)
+  shared_variables = variables_1 & variables_2
+  if shared_variables:
     raise ValueError(
         'After making a copy of network \'{}\' to create a target '
         'network \'{}\', the target network shares weights with '
@@ -1227,7 +1226,9 @@ def check_no_shared_variables(network_1, network_2):
         'share weights make sure all the weights are created inside the Network'
         ' since a copy will be created by creating a new Network with the same '
         'args but a new name. Shared variables found: '
-        '\'{}\'.'.format(network_1.name, network_2.name, shared_variables))
+        '\'{}\'.'.format(
+            network_1.name, network_2.name,
+            [x.name for x in shared_variables]))
 
 
 def check_matching_networks(network_1, network_2):
@@ -1259,11 +1260,12 @@ def check_matching_networks(network_1, network_2):
 
 
 def maybe_copy_target_network_with_checks(network, target_network=None,
-                                          name='TargetNetwork'):
+                                          name=None,
+                                          input_spec=None):
   """Copies the network into target if None and checks for shared variables."""
   if target_network is None:
     target_network = network.copy(name=name)
-    target_network.create_variables()
+    target_network.create_variables(input_spec)
   # Copy may have been shallow, and variables may inadvertently be shared
   # between the target and the original networks. This would be an unusual
   # setup, so we throw an error to protect users from accidentally doing so.
@@ -1292,8 +1294,9 @@ def aggregate_losses(per_example_loss=None,
   would use the batch_dim of per_example_loss and number of replicas.
 
   Args:
-    per_example_loss: Per-example loss [B].
-    sample_weight: Optional weighting for each example [B].
+    per_example_loss: Per-example loss [B] or [B, T, ...].
+    sample_weight: Optional weighting for each example, Tensor shaped [B] or
+      [B, T, ...], or a scalar float.
     global_batch_size: Optional global batch size value. Defaults to (size of
     first dimension of `losses`) * (number of replicas).
     regularization_loss: Regularization loss.
@@ -1302,9 +1305,21 @@ def aggregate_losses(per_example_loss=None,
     An AggregatedLosses named tuple with scalar losses to optimize.
   """
   total_loss, weighted_loss, reg_loss = None, None, None
+  if sample_weight is not None and not isinstance(sample_weight, tf.Tensor):
+    sample_weight = tf.convert_to_tensor(sample_weight, dtype=tf.float32)
+
   # Compute loss that is scaled by global batch size.
   if per_example_loss is not None:
     loss_rank = per_example_loss.shape.rank
+    if sample_weight is not None:
+      weight_rank = sample_weight.shape.rank
+      # Expand `sample_weight` to be broadcastable to the shape of
+      # `per_example_loss`, to ensure that multiplication works properly.
+      if weight_rank > 0 and loss_rank > weight_rank:
+        for dim in range(weight_rank, loss_rank):
+          sample_weight = tf.expand_dims(sample_weight, dim)
+      per_example_loss = tf.math.multiply(per_example_loss, sample_weight)
+
     if loss_rank is not None and loss_rank == 0:
       err_msg = (
           'Need to use a loss function that computes losses per sample, ex: '
@@ -1317,9 +1332,15 @@ def aggregate_losses(per_example_loss=None,
         logging.warning(err_msg)
         # Add extra dimension to prevent error in compute_average_loss.
         per_example_loss = tf.expand_dims(per_example_loss, 0)
+    elif loss_rank > 1:
+      # If per_example_loss is shaped [B, T, ...], we need to compute the mean
+      # across the extra dimensions, ex. time, as well.
+      per_example_loss = tf.reduce_mean(per_example_loss, range(1, loss_rank))
+
+    global_batch_size = global_batch_size and tf.cast(global_batch_size,
+                                                      per_example_loss.dtype)
     weighted_loss = tf.nn.compute_average_loss(
         per_example_loss,
-        sample_weight=sample_weight,
         global_batch_size=global_batch_size)
     total_loss = weighted_loss
   # Add scaled regularization losses.
