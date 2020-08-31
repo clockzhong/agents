@@ -26,6 +26,7 @@ from typing import Text, Union
 
 from absl import logging
 
+from tf_agents.typing import types
 from tf_agents.utils import lazy_loader
 
 # Lazy loading since not all users have the reverb package installed.
@@ -36,10 +37,10 @@ class ReverbAddEpisodeObserver(object):
   """Observer for writing episodes to the Reverb replay buffer."""
 
   def __init__(self,
-               py_client: reverb.Client,
+               py_client: types.ReverbClient,
                table_name: Text,
                max_sequence_length: int,
-               priority: Union[float, int],
+               priority: Union[float, int] = 1,
                bypass_partial_episodes: bool = False):
     """Creates an instance of the ReverbAddEpisodeObserver.
 
@@ -143,9 +144,9 @@ class ReverbAddEpisodeObserver(object):
       self._cached_steps += 1
 
     if trajectory.is_boundary():
-      self._write_cached_steps()
+      self.write_cached_steps()
 
-  def _write_cached_steps(self):
+  def write_cached_steps(self):
     """Writes the cached steps into the writer.
 
     **Note**: The method resets the number of episodes and steps after writing
@@ -157,17 +158,17 @@ class ReverbAddEpisodeObserver(object):
           num_timesteps=self._cached_steps,
           priority=self._priority)
     self.reset()
-    self._overflow_episode = False
 
   def reset(self):
     """Resets the state of the observer.
 
-    The observed data (appended to the writer) will be written to RB after
-    calling reset. Note that, each write creates a separate entry in the
-    replay buffer.
+    Note that the data cached in the writer will NOT get automatically written
+    into the Reverb table. If you wish to write the cached partial episode as
+    a new sequences, call `write_cached_steps` instead.
     """
     self.close()
     self.open()
+    self._overflow_episode = False
 
   def open(self):
     """Open the writer of the observer."""
@@ -188,18 +189,14 @@ class ReverbAddEpisodeObserver(object):
 
 
 class ReverbAddTrajectoryObserver(object):
-  """Stateful observer for writing to the Reverb replay.
-
-  b/158373731: Simplify the observer to only support step insertion.
-  """
+  """Stateful observer for writing to the Reverb replay."""
 
   def __init__(self,
-               py_client: reverb.Client,
+               py_client: types.ReverbClient,
                table_name: Text,
                sequence_length: int,
                stride_length: int = 1,
-               priority: Union[float, int] = 5,
-               allow_multi_episode_sequences: bool = False):
+               priority: Union[float, int] = 1):
     """Creates an instance of the ReverbAddTrajectoryObserver.
 
     If multiple table_names and sequence lengths are provided data will only be
@@ -221,10 +218,6 @@ class ReverbAddTrajectoryObserver(object):
         `stride_length = L` will create an item only for disjoint windows
         `{0, 1, ..., L-1}, {L, ..., 2 * L - 1}, ...`.
       priority: Initial priority for new samples in the RB.
-      allow_multi_episode_sequences: Allows sequences to go over episode
-        boundaries. **NOTE**: Samples generated when data is collected with this
-        flag set to True will contain episode boundaries which need to be
-        handled by the user.
 
     Raises:
       ValueError: If table_names or sequence_lengths are not lists or their
@@ -234,7 +227,6 @@ class ReverbAddTrajectoryObserver(object):
     self._sequence_length = sequence_length
     self._stride_length = stride_length
     self._priority = priority
-    self._allow_multi_episode_sequences = allow_multi_episode_sequences
 
     self._py_client = py_client
     # TODO(b/153700282): Use a single writer with max_sequence_length=max(...)
@@ -243,7 +235,7 @@ class ReverbAddTrajectoryObserver(object):
     self._writer = py_client.writer(max_sequence_length=sequence_length)
     self._cached_steps = 0
 
-  def __call__(self, trajectory, force_is_boundary=None):
+  def __call__(self, trajectory):
     """Writes the trajectory into the underlying replay buffer.
 
     Allows trajectory to be a flattened trajectory. No batch dimension allowed.
@@ -252,8 +244,6 @@ class ReverbAddTrajectoryObserver(object):
       trajectory: The trajectory to be written which could be (possibly nested)
         trajectory object or a flattened version of a trajectory. It assumes
         there is *no* batch dimension.
-      force_is_boundary: Forces the indication of the trajectory being boundary.
-        Useful if a flattened trajectory is provided.
     """
     self._writer.append(trajectory)
     self._cached_steps += 1
@@ -261,10 +251,8 @@ class ReverbAddTrajectoryObserver(object):
     self._write_cached_steps()
 
     # Reset the client on boundary transitions.
-    if not self._allow_multi_episode_sequences:
-      if self._is_boundary(trajectory, force_is_boundary):
-        self.close()
-        self.open()
+    if trajectory.is_boundary():
+      self.reset()
 
   def _write_cached_steps(self):
     """Writes the cached steps into the writer.
@@ -284,15 +272,6 @@ class ReverbAddTrajectoryObserver(object):
         self._writer,
         self._sequence_length,
         self._stride_length)
-
-  def _is_boundary(self, trajectory, force_is_boundary):
-    if force_is_boundary is not None:
-      # Assumed the trajectory is flat, so being boundary is supllied as a side
-      # input.
-      return force_is_boundary
-    # Assumed trajectory is is a true `Trajectory` object, so use the
-    # corresponding method to decide if this is boundary trajectory.
-    return trajectory.is_boundary()
 
   def reset(self):
     """Resets the state of the observer.

@@ -35,11 +35,11 @@ from setuptools.dist import Distribution
 
 # Default versions for packages we often override for testing and release
 # candidates. These can all be overridden with flags.
-TFP_VERSION = 'tensorflow-probability==0.11.0rc0'
+TFP_VERSION = 'tensorflow-probability>=0.11.0'
 TFP_NIGHTLY = 'tfp-nightly'
 TENSORFLOW_VERSION = 'tensorflow>=2.3.0'
 TENSORFLOW_NIGHTLY = 'tf-nightly'
-REVERB_VERSION = 'dm-reverb'
+REVERB_VERSION = 'dm-reverb>=0.1.0'
 REVERB_NIGHTLY = 'dm-reverb-nightly'
 
 
@@ -56,15 +56,15 @@ class StderrWrapper(io.IOBase):
 
 class TestLoader(unittest.TestLoader):
 
-  def __init__(self, blacklist):
+  def __init__(self, exclude_list):
     super(TestLoader, self).__init__()
-    self._blacklist = blacklist
+    self._exclude_list = exclude_list
 
   def _match_path(self, path, full_path, pattern):
     if not fnmatch.fnmatch(path, pattern):
       return False
     module_name = full_path.replace('/', '.').rstrip('.py')
-    if any(module_name.endswith(x) for x in self._blacklist):
+    if any(module_name.endswith(x) for x in self._exclude_list):
       return False
     return True
 
@@ -95,11 +95,22 @@ class Test(TestCommandBase):
       # Reimport multiprocessing to avoid spurious error printouts. See
       # https://bugs.python.org/issue15881.
       import multiprocessing as _  # pylint: disable=g-import-not-at-top
+      import tensorflow as tf  # pylint: disable=g-import-not-at-top
+
+      # Sets all GPUs to 1GB of memory. The process running the bulk of the unit
+      # tests allocates all GPU memory because by default TensorFlow allocates
+      # all GPU memory during initialization. This causes tests in
+      # run_seperately to fail with out of memory errors because they are run as
+      # a subprocess of the process holding the GPU memory.
+      gpus = tf.config.experimental.list_physical_devices('GPU')
+      for gpu in gpus:
+        tf.config.set_logical_device_configuration(
+            gpu, [tf.config.LogicalDeviceConfiguration(memory_limit=1024)])
 
       run_separately = load_test_list('test_individually.txt')
       broken_tests = load_test_list('broken_tests.txt')
 
-      test_loader = TestLoader(blacklist=run_separately + broken_tests)
+      test_loader = TestLoader(exclude_list=run_separately + broken_tests)
       test_suite = test_loader.discover('tf_agents', pattern='*_test.py')
       stderr = StderrWrapper()
       result = unittest.TextTestResult(stderr, descriptions=True, verbosity=2)
@@ -160,6 +171,7 @@ def get_required_packages():
       'six >= 1.10.0',
       'protobuf >= 3.11.3',
       'wrapt >= 1.11.1',
+      'pillow >= 7.0.0',
   ]
   add_additional_packages(required_packages)
   return required_packages

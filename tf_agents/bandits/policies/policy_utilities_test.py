@@ -23,8 +23,8 @@ from absl.testing import parameterized
 import numpy as np
 import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
 
-from tf_agents.bandits.agents import constraints
 from tf_agents.bandits.networks import global_and_arm_feature_network
+from tf_agents.bandits.policies import constraints
 from tf_agents.bandits.policies import policy_utilities
 from tf_agents.bandits.specs import utils as bandit_spec_utils
 from tf_agents.networks import network
@@ -97,6 +97,19 @@ class PolicyUtilitiesTest(test_utils.TestCase, parameterized.TestCase):
     actual = self.evaluate(
         policy_utilities.masked_argmax(input_tensor, tf.constant(mask)))
     self.assertAllEqual(actual, expected)
+
+  def testNumActionsFromTensorSpecGoodSpec(self):
+    action_spec = tensor_spec.BoundedTensorSpec(
+        dtype=tf.int32, shape=(), minimum=0, maximum=15)
+    num_actions = policy_utilities.get_num_actions_from_tensor_spec(action_spec)
+    self.assertEqual(num_actions, 16)
+
+  def testNumActionsFromTensorSpecWrongRank(self):
+    action_spec = tensor_spec.BoundedTensorSpec(
+        dtype=tf.int32, shape=(2, 3), minimum=0, maximum=15)
+
+    with self.assertRaisesRegex(ValueError, r'Action spec must be a scalar'):
+      policy_utilities.get_num_actions_from_tensor_spec(action_spec)
 
   def testSetBanditPolicyType(self):
     dims = (10, 1)

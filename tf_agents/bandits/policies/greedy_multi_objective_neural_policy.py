@@ -21,11 +21,12 @@ from __future__ import division
 from __future__ import print_function
 
 import copy
-from typing import Callable, List, Optional, Sequence, Text, Tuple, Union
+from typing import List, Optional, Sequence, Text, Tuple
 
 import gin
-import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
+import tensorflow as tf
 import tensorflow_probability as tfp
+
 from tf_agents.bandits.multi_objective import multi_objective_scalarizer
 from tf_agents.bandits.networks import heteroscedastic_q_network
 from tf_agents.bandits.policies import policy_utilities
@@ -36,11 +37,6 @@ from tf_agents.specs import tensor_spec
 from tf_agents.trajectories import policy_step
 from tf_agents.trajectories import time_step as ts
 from tf_agents.typing import types
-
-NestedBoundedTensorSpec = types.Nested[tensor_spec.BoundedTensorSpec]
-SplitterFn = Union[Callable[[tensor_spec.TensorSpec], tensor_spec.TensorSpec],
-                   Callable[[types.NestedSpecTensorOrArray],
-                            Tuple[types.NestedSpecTensorOrArray, tf.Tensor]]]
 
 
 @tf.function
@@ -81,7 +77,7 @@ class GreedyMultiObjectiveNeuralPolicy(tf_policy.TFPolicy):
   def __init__(
       self,
       time_step_spec: Optional[ts.TimeStep],
-      action_spec: Optional[NestedBoundedTensorSpec],
+      action_spec: Optional[types.NestedBoundedTensorSpec],
       scalarizer: multi_objective_scalarizer.Scalarizer,
       objective_networks: Sequence[Network],
       observation_and_action_constraint_splitter: types.Splitter = None,
@@ -132,6 +128,8 @@ class GreedyMultiObjectiveNeuralPolicy(tf_policy.TFPolicy):
       ValueError: If `accepts_per_arm_features` is true but `time_step_spec` is
         None.
     """
+    policy_utilities.check_no_mask_with_arm_features(
+        accepts_per_arm_features, observation_and_action_constraint_splitter)
     flat_action_spec = tf.nest.flatten(action_spec)
     if len(flat_action_spec) > 1:
       raise NotImplementedError(
@@ -176,8 +174,7 @@ class GreedyMultiObjectiveNeuralPolicy(tf_policy.TFPolicy):
       # The features for the chosen arm is saved to policy_info.
       chosen_arm_features_info = (
           policy_utilities.create_chosen_arm_features_info_spec(
-              time_step_spec.observation,
-              observation_and_action_constraint_splitter))
+              time_step_spec.observation))
       info_spec = policy_utilities.PerArmPolicyInfo(
           predicted_rewards_mean=predicted_rewards_mean,
           bandit_policy_type=bandit_policy_type,
@@ -201,8 +198,12 @@ class GreedyMultiObjectiveNeuralPolicy(tf_policy.TFPolicy):
         name=name)
 
   @property
-  def accepts_per_arm_features(self):
+  def accepts_per_arm_features(self) -> bool:
     return self._accepts_per_arm_features
+
+  @property
+  def scalarizer(self) -> multi_objective_scalarizer.Scalarizer:
+    return self._scalarizer
 
   def _predict(
       self, observation: types.NestedSpecTensorOrArray,
@@ -267,7 +268,9 @@ class GreedyMultiObjectiveNeuralPolicy(tf_policy.TFPolicy):
         observation, time_step.step_type, policy_state)
     scalarized_reward = scalarize_objectives(predicted_objective_values_tensor,
                                              self._scalarizer)
-    batch_size = scalarized_reward.shape[0]
+    # Preserve static batch size values when they are available.
+    batch_size = (tf.compat.dimension_value(scalarized_reward.shape[0])
+                  or tf.shape(scalarized_reward)[0])
     mask = policy_utilities.construct_mask_from_multiple_sources(
         time_step.observation, self._observation_and_action_constraint_splitter,
         (), self._expected_num_actions)

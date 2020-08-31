@@ -39,7 +39,7 @@ class PyDriver(driver.Driver):
       env: py_environment.PyEnvironment,
       policy: py_policy.PyPolicy,
       observers: Sequence[Callable[[trajectory.Trajectory], Any]],
-      transition_observers: Optional[Sequence[Callable[[types.Transition],
+      transition_observers: Optional[Sequence[Callable[[trajectory.Transition],
                                                        Any]]] = None,
       max_steps: Optional[types.Int] = None,
       max_episodes: Optional[types.Int] = None):
@@ -103,7 +103,7 @@ class PyDriver(driver.Driver):
       for observer in self.observers:
         observer(traj)
 
-      num_episodes += np.sum(traj.is_last())
+      num_episodes += np.sum(traj.is_boundary())
       num_steps += np.sum(~traj.is_boundary())
 
       time_step = next_time_step

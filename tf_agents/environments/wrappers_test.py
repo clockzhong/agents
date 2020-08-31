@@ -23,6 +23,7 @@ import collections
 import cProfile
 import math
 import pstats
+from typing import cast, Mapping, Text, Any
 
 from absl.testing import parameterized
 from absl.testing.absltest import mock
@@ -460,6 +461,28 @@ class ActionDiscretizeWrapper(test_utils.TestCase):
       action = env.step([[0, 2], [1, 1]])
       np.testing.assert_array_almost_equal([[-10.0, 0.0], [0.0, 10.0]], action)
 
+  def test_action_mapping_nd_with_same_limits(self):
+    obs_spec = array_spec.BoundedArraySpec((2, 3), np.int32, -10, 10)
+    action_spec = array_spec.BoundedArraySpec((2, 2), np.float32, -10, 10)
+    limits = np.array([[3, 3], [3, 3]])
+
+    def mock_step(_, action):
+      return action
+
+    with mock.patch.object(
+        random_py_environment.RandomPyEnvironment,
+        '_step',
+        side_effect=mock_step,
+        autospec=True,
+    ):
+      env = random_py_environment.RandomPyEnvironment(
+          obs_spec, action_spec=action_spec)
+      env = wrappers.ActionDiscretizeWrapper(env, limits)
+      env.reset()
+
+      action = env.step([[0, 2], [1, 1]])
+      np.testing.assert_array_almost_equal([[-10.0, 10.0], [0.0, 0.0]], action)
+
   def test_shapes_broadcast(self):
     obs_spec = array_spec.BoundedArraySpec((2, 3), np.int32, -10, 10)
     action_spec = array_spec.BoundedArraySpec((2, 2), np.float32, -10, 10)
@@ -888,12 +911,15 @@ class GoalReplayEnvWrapperTest(parameterized.TestCase):
                                                    np.random.RandomState())
     time_step = env.step(random_action)
     self.assertIsInstance(time_step.observation, dict)
-    self.assertEqual(time_step.observation.keys(),
-                     env.observation_spec().keys())
+    observation = cast(Mapping[Text, Any], time_step.observation)
+    observation_spec = cast(Mapping[Text, Any], env.observation_spec())
+    self.assertEqual(observation.keys(),
+                     observation_spec.keys())
     time_step = env.reset()
     self.assertIsInstance(time_step.observation, dict)
-    self.assertEqual(time_step.observation.keys(),
-                     env.observation_spec().keys())
+    observation = cast(Mapping[Text, Any], time_step.observation)
+    self.assertEqual(observation.keys(),
+                     observation_spec.keys())
 
   def test_batch_env(self):
     """Test batched version of the environment."""
@@ -913,12 +939,15 @@ class GoalReplayEnvWrapperTest(parameterized.TestCase):
 
     time_step = env.step(random_action)
     self.assertIsInstance(time_step.observation, dict)
-    self.assertEqual(time_step.observation.keys(),
-                     env.observation_spec().keys())
+    observation = cast(Mapping[Text, Any], time_step.observation)
+    observation_spec = cast(Mapping[Text, Any], env.observation_spec())
+    self.assertEqual(observation.keys(),
+                     observation_spec.keys())
     time_step = env.reset()
     self.assertIsInstance(time_step.observation, dict)
-    self.assertEqual(time_step.observation.keys(),
-                     env.observation_spec().keys())
+    observation = cast(Mapping[Text, Any], time_step.observation)
+    self.assertEqual(observation.keys(),
+                     observation_spec.keys())
 
 
 class HistoryWrapperTest(test_utils.TestCase):

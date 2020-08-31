@@ -28,6 +28,7 @@ from tf_agents.agents import tf_agent
 from tf_agents.bandits.agents import utils as bandit_utils
 from tf_agents.bandits.networks import heteroscedastic_q_network
 from tf_agents.bandits.policies import greedy_reward_prediction_policy as greedy_reward_policy
+from tf_agents.bandits.policies import policy_utilities
 from tf_agents.bandits.specs import utils as bandit_spec_utils
 from tf_agents.utils import common
 from tf_agents.utils import eager_utils
@@ -136,7 +137,7 @@ class GreedyRewardPredictionAgent(tf_agent.TFAgent):
     common.tf_agents_gauge.get_cell('TFABandit').set(True)
     self._observation_and_action_constraint_splitter = (
         observation_and_action_constraint_splitter)
-    self._num_actions = bandit_utils.get_num_actions_from_tensor_spec(
+    self._num_actions = policy_utilities.get_num_actions_from_tensor_spec(
         action_spec)
     self._accepts_per_arm_features = accepts_per_arm_features
     self._constraints = constraints
@@ -170,7 +171,7 @@ class GreedyRewardPredictionAgent(tf_agent.TFAgent):
     training_data_spec = None
     if accepts_per_arm_features:
       training_data_spec = bandit_spec_utils.drop_arm_observation(
-          policy.trajectory_spec, observation_and_action_constraint_splitter)
+          policy.trajectory_spec)
 
     super(GreedyRewardPredictionAgent, self).__init__(
         time_step_spec,
@@ -188,7 +189,7 @@ class GreedyRewardPredictionAgent(tf_agent.TFAgent):
     tf.compat.v1.variables_initializer(self.variables)
 
   def _variables_to_train(self):
-    variables_to_train = self._reward_network.variables
+    variables_to_train = self._reward_network.trainable_variables
     for c in self._constraints:
       variables_to_train.extend(c.variables)
     return variables_to_train
@@ -196,8 +197,10 @@ class GreedyRewardPredictionAgent(tf_agent.TFAgent):
   def _train(self, experience, weights):
     (observations, actions,
      rewards) = bandit_utils.process_experience_for_neural_agents(
-         experience, self._observation_and_action_constraint_splitter,
-         self._accepts_per_arm_features, self.training_data_spec)
+         experience, self._accepts_per_arm_features, self.training_data_spec)
+    if self._observation_and_action_constraint_splitter is not None:
+      observations, _ = self._observation_and_action_constraint_splitter(
+          observations)
 
     with tf.GradientTape() as tape:
       loss_info = self.loss(observations,

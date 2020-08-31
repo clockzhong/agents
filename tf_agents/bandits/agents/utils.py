@@ -22,8 +22,8 @@ from __future__ import print_function
 import gin
 import numpy as np
 import tensorflow as tf  # pylint: disable=g-explicit-tensorflow-version-import
+from tf_agents.bandits.policies import policy_utilities
 from tf_agents.bandits.specs import utils as bandit_spec_utils
-from tf_agents.specs import tensor_spec
 from tf_agents.utils import nest_utils
 
 
@@ -50,36 +50,6 @@ def sum_reward_weighted_observations(r, x):
   return tf.reduce_sum(tf.reshape(r, [batch_size, 1]) * x, axis=0)
 
 
-def get_num_actions_from_tensor_spec(action_spec):
-  """Validates `action_spec` and returns number of actions.
-
-  `action_spec` must specify a scalar int32 or int64 with minimum zero.
-
-  Args:
-    action_spec: a `TensorSpec`.
-
-  Returns:
-    The number of actions described by `action_spec`.
-
-  Raises:
-    ValueError: if `action_spec` is not an bounded scalar int32 or int64 spec
-      with minimum 0.
-  """
-  if not isinstance(action_spec, tensor_spec.BoundedTensorSpec):
-    raise ValueError('Action spec must be a `BoundedTensorSpec`; '
-                     'got {}'.format(type(action_spec)))
-  if action_spec.shape.rank != 0:
-    raise ValueError('Action spec must be a scalar; '
-                     'got shape{}'.format(action_spec.shape))
-  if action_spec.dtype not in (tf.int32, tf.int64):
-    raise ValueError('Action spec must be have dtype int32 or int64; '
-                     'got {}'.format(action_spec.dtype))
-  if action_spec.minimum != 0:
-    raise ValueError('Action spec must have minimum 0; '
-                     'got {}'.format(action_spec.minimum))
-  return action_spec.maximum + 1
-
-
 @gin.configurable
 def build_laplacian_over_ordinal_integer_actions(action_spec):
   """Build the unnormalized Laplacian matrix over ordinal integer actions.
@@ -102,7 +72,7 @@ def build_laplacian_over_ordinal_integer_actions(action_spec):
     ValueError: if `action_spec` is not a bounded scalar int32 or int64 spec
       with minimum 0.
   """
-  num_actions = get_num_actions_from_tensor_spec(action_spec)
+  num_actions = policy_utilities.get_num_actions_from_tensor_spec(action_spec)
   adjacency_matrix = np.zeros([num_actions, num_actions])
   for i in range(num_actions - 1):
     adjacency_matrix[i, i + 1] = 1.0
@@ -174,25 +144,21 @@ def build_laplacian_nearest_neighbor_graph(input_vecs, k=1):
 
 def process_experience_for_neural_agents(
     experience,
-    observation_and_action_constraint_splitter,
     accepts_per_arm_features,
     training_data_spec):
   """Processes the experience and prepares it for the network of the agent.
 
   First the reward, the action, and the observation are flattened to have only
-  one batch dimension. Then the action mask is removed if it is there. Finally,
-  if the experience includes chosen action features in the policy info, it gets
-  copied in place of the per-arm observation.
+  one batch dimension. Then, if the experience includes chosen action features
+  in the policy info, it gets copied in place of the per-arm observation.
 
   Args:
     experience: The experience coming from the replay buffer.
-    observation_and_action_constraint_splitter: If the agent accepts action
-      masks, this function splits the mask from the observation.
     accepts_per_arm_features: Whether the agent accepts per-arm features.
     training_data_spec: The data spec describing what the agent expects.
 
   Returns:
-    A tuple of (reward, action, observation) tensors to be consumed by the train
+    A tuple of (observation, action, reward) tensors to be consumed by the train
       function of the neural agent.
   """
   flattened_experience, _ = nest_utils.flatten_multi_batched_nested_tensors(
@@ -202,23 +168,22 @@ def process_experience_for_neural_agents(
   action = flattened_experience.action
   reward = flattened_experience.reward
 
-  if observation_and_action_constraint_splitter is not None:
-    observation, _ = observation_and_action_constraint_splitter(
-        observation)
-  if accepts_per_arm_features:
-    # The arm observation we train on needs to be copied from the respective
-    # policy info field to the per arm observation field. Pretending there was
-    # only one action, we fill the action field with zeros.
-    chosen_arm_features = flattened_experience.policy_info.chosen_arm_features
-    observation[bandit_spec_utils.PER_ARM_FEATURE_KEY] = tf.nest.map_structure(
-        lambda t: tf.expand_dims(t, axis=1), chosen_arm_features)
-    action = tf.zeros_like(action)
-    if bandit_spec_utils.NUM_ACTIONS_FEATURE_KEY in observation:
-      # This change is not crucial but since in training there will be only one
-      # action per sample, it's good to follow the convention that the feature
-      # value for `num_actions` be less than or equal to the maximum available
-      # number of actions.
-      observation[bandit_spec_utils.NUM_ACTIONS_FEATURE_KEY] = tf.ones_like(
-          observation[bandit_spec_utils.NUM_ACTIONS_FEATURE_KEY])
+  if not accepts_per_arm_features:
+    return observation, action, reward
+
+  # The arm observation we train on needs to be copied from the respective
+  # policy info field to the per arm observation field. Pretending there was
+  # only one action, we fill the action field with zeros.
+  chosen_arm_features = flattened_experience.policy_info.chosen_arm_features
+  observation[bandit_spec_utils.PER_ARM_FEATURE_KEY] = tf.nest.map_structure(
+      lambda t: tf.expand_dims(t, axis=1), chosen_arm_features)
+  action = tf.zeros_like(action)
+  if bandit_spec_utils.NUM_ACTIONS_FEATURE_KEY in observation:
+    # This change is not crucial but since in training there will be only one
+    # action per sample, it's good to follow the convention that the feature
+    # value for `num_actions` be less than or equal to the maximum available
+    # number of actions.
+    observation[bandit_spec_utils.NUM_ACTIONS_FEATURE_KEY] = tf.ones_like(
+        observation[bandit_spec_utils.NUM_ACTIONS_FEATURE_KEY])
 
   return observation, action, reward
